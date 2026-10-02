@@ -14,70 +14,88 @@ import (
 )
 
 // ============================================================
-// Состояния процесса
+// 3. Тип для состояния процесса
 // ============================================================
 
 type ProcessState string
 
 const (
-	StateAbsent  ProcessState = "Отсутствует"
-	StateReady   ProcessState = "Готов"
-	StateActive  ProcessState = "Активен"
-	StateBlocked ProcessState = "Блокирован"
+	StateAbsent  ProcessState = "Отсутствует" // 0
+	StateReady   ProcessState = "Готов"       // 1
+	StateActive  ProcessState = "Активен"     // 2
+	StateBlocked ProcessState = "Блокирован"  // 3
 )
 
-// ============================================================
-// PSW — Process Status Word
-// ============================================================
-
-type PSW struct {
-	TaskID        int // Идентификатор задания
-	Size          int // Размер задания в памяти
-	PC            int // Текущий счетчик команд процесса
-	TotalCommands int // Общее количество команд
-
-	BasePriority int // Постоянный базовый приоритет
-	DynPriority  int // Динамическая надбавка к базовому приоритету
-
-	QuantumUsed int // Сколько команд выполнено в текущем кванте
-
-	State ProcessState // Состояние процесса
+// Код состояния (для вывода)
+func StateCode(s ProcessState) int {
+	switch s {
+	case StateAbsent:
+		return 0
+	case StateReady:
+		return 1
+	case StateActive:
+		return 2
+	case StateBlocked:
+		return 3
+	default:
+		return -1
+	}
 }
 
 // ============================================================
-// CPU — Центральный процессор
+// 4. Слово состояния процесса (PSW)
+// ============================================================
+
+type PSW struct {
+	TaskID        int          // Идентификатор задания
+	Size          int          // Размер задания в памяти
+	PC            int          // Счётчик команд
+	TotalCommands int          // Общее количество команд
+	BasePriority  int          // Базовый приоритет
+	DynPriority   int          // Динамическая надбавка
+	QuantumUsed   int          // Команд в текущем кванте
+	State         ProcessState // Состояние процесса
+}
+
+// ============================================================
+// 1. Параметры процессора (значения по умолчанию)
 // ============================================================
 
 type CPU struct {
 	ID           int
-	ActiveProcID int
+	ActiveProcID int  // -1 = свободен
 	PC           int
 	IsBusy       bool
 }
 
 // ============================================================
-// SystemModel — модель операционной системы
+// 2. Параметры системы (значения по умолчанию)
 // ============================================================
 
 type SystemModel struct {
 	mu sync.Mutex
 
-	TotalMemory int
-	FreeMemory  int
+	// Параметры системы (по умолчанию)
+	TotalMemory int     // Размер ОЗУ
+	FreeMemory  int     // Свободная память
+	Speed       float64 // Скорость моделирования (тактов/сек)
+	Kvant       int     // Квант времени (команд)
 
-	Speed float64
-	Kvant int
-
-	GlobalPC uint64
+	GlobalPC uint64 // Глобальный счётчик тактов
 
 	IsRunning bool
 	PauseLoad bool
 
 	NextTaskID int
 
+	// 1. Параметры процессоров
 	CPUs []CPU
 
+	// 5. Массив слов состояний процессов (PSW)
 	ProcessTable [16]PSW
+
+	// 6. Переменная для нового задания
+	PSW_Task PSW
 
 	LastAction string
 
@@ -85,18 +103,18 @@ type SystemModel struct {
 }
 
 // ============================================================
-// Создание системы
+// Создание системы + инициализация (п. 7)
 // ============================================================
 
 func NewSystemModel() *SystemModel {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	sys := &SystemModel{
+		// Параметры системы — значения по умолчанию
 		TotalMemory: 1024,
 		FreeMemory:  1024,
-
-		Speed: 10.0,
-		Kvant: 10,
+		Speed:       10.0,
+		Kvant:       10,
 
 		GlobalPC: 0,
 
@@ -105,6 +123,7 @@ func NewSystemModel() *SystemModel {
 
 		NextTaskID: 1,
 
+		// 3 ЦП (можно изменить под конкретный вариант)
 		CPUs: make([]CPU, 3),
 
 		LastAction: "Ожидание ввода...",
@@ -112,7 +131,7 @@ func NewSystemModel() *SystemModel {
 		RNG: rng,
 	}
 
-	// Инициализация 3 процессоров
+	// Инициализация процессоров
 	for i := 0; i < len(sys.CPUs); i++ {
 		sys.CPUs[i] = CPU{
 			ID:           i + 1,
@@ -122,7 +141,7 @@ func NewSystemModel() *SystemModel {
 		}
 	}
 
-	// Инициализация таблицы процессов
+	// 7. Инициализация массива слов состояний процессов
 	for i := range sys.ProcessTable {
 		sys.ProcessTable[i] = PSW{
 			State: StateAbsent,
@@ -133,13 +152,13 @@ func NewSystemModel() *SystemModel {
 }
 
 // ============================================================
-// Вывод справки
+// Справка
 // ============================================================
 
 func PrintHelp() {
 	fmt.Println("=========================================================================")
-	fmt.Println("  Модель ОС: Распределение времени ЦП")
-	fmt.Println("  Вариант 5: 3 ЦП, базовые и динамические приоритеты")
+	fmt.Println("  Модель ОС: Генерация и загрузка задач")
+	fmt.Println("  Лабораторная работа 2 | Вариант 25")
 	fmt.Println("=========================================================================")
 	fmt.Println("Запуск:")
 	fmt.Println("  go run main.go       — Запуск моделирования")
@@ -153,10 +172,7 @@ func PrintHelp() {
 }
 
 // ============================================================
-// Получение итогового приоритета
-//
-// Итоговый приоритет:
-//     BasePriority + DynPriority
+// Итоговый приоритет
 // ============================================================
 
 func (sys *SystemModel) EffectivePriority(proc *PSW) int {
@@ -164,39 +180,29 @@ func (sys *SystemModel) EffectivePriority(proc *PSW) int {
 }
 
 // ============================================================
-// Генерация нового процесса
+// 8. Подпрограмма «Генерация нового задания»
 // ============================================================
 
 func (sys *SystemModel) GenerateTask() PSW {
-	// Базовый приоритет случайно от 1 до 10
-	basePriority := 1 + sys.RNG.Intn(10)
+	basePriority := 1 + sys.RNG.Intn(10) // 1..10
 
 	task := PSW{
-		TaskID: sys.NextTaskID,
-
-		Size: 128 + (sys.NextTaskID*32)%256,
-
+		TaskID:        sys.NextTaskID,
+		Size:          64 + (sys.NextTaskID*16)%192, // 64..255
 		PC:            0,
-		TotalCommands: 50 + (sys.NextTaskID*15)%100,
-
-		// Базовый приоритет — постоянный
-		BasePriority: basePriority,
-
-		// Динамическая часть изначально отсутствует
-		DynPriority: 0,
-
-		QuantumUsed: 0,
-
-		State: StateReady,
+		TotalCommands: 40 + (sys.NextTaskID*10)%80, // 40..119
+		BasePriority:  basePriority,
+		DynPriority:   0,
+		QuantumUsed:   0,
+		State:         StateReady,
 	}
 
 	sys.NextTaskID++
-
 	return task
 }
 
 // ============================================================
-// Проверка памяти
+// 9. Подпрограмма «Проверка наличия доступной памяти»
 // ============================================================
 
 func (sys *SystemModel) HasFreeMemory(required int) bool {
@@ -204,7 +210,7 @@ func (sys *SystemModel) HasFreeMemory(required int) bool {
 }
 
 // ============================================================
-// Загрузка нового процесса
+// 10. Подпрограмма «Загрузка нового задания»
 // ============================================================
 
 func (sys *SystemModel) LoadTask() bool {
@@ -212,48 +218,46 @@ func (sys *SystemModel) LoadTask() bool {
 		return false
 	}
 
+	// Ищем свободный слот в таблице PSW
 	freeSlot := -1
-
-	// Ищем свободный слот
 	for i := 0; i < len(sys.ProcessTable); i++ {
 		if sys.ProcessTable[i].State == StateAbsent {
 			freeSlot = i
 			break
 		}
 	}
-
 	if freeSlot == -1 {
+		sys.LastAction = "Нет свободных слотов в таблице процессов"
 		return false
 	}
 
-	newTask := sys.GenerateTask()
+	// 8. Генерируем новое задание
+	sys.PSW_Task = sys.GenerateTask()
 
-	// Проверка памяти
-	if !sys.HasFreeMemory(newTask.Size) {
+	// 9. Проверка памяти
+	if !sys.HasFreeMemory(sys.PSW_Task.Size) {
+		sys.LastAction = fmt.Sprintf(
+			"Недостаточно памяти для задания #%d (нужно %d, свободно %d)",
+			sys.PSW_Task.TaskID, sys.PSW_Task.Size, sys.FreeMemory,
+		)
 		return false
 	}
 
 	// Выделяем память
-	sys.FreeMemory -= newTask.Size
+	sys.FreeMemory -= sys.PSW_Task.Size
 
-	// Загружаем процесс
-	sys.ProcessTable[freeSlot] = newTask
+	// Передаём в свободный слот таблицы
+	sys.ProcessTable[freeSlot] = sys.PSW_Task
 
 	sys.LastAction = fmt.Sprintf(
-		"Создан процесс #%d: Base=%d, Dyn=%d, Effective=%d",
-		newTask.TaskID,
-		newTask.BasePriority,
-		newTask.DynPriority,
-		newTask.BasePriority+newTask.DynPriority,
+		"Загружено задание #%d в слот [%02d]: Size=%d, Base=%d",
+		sys.PSW_Task.TaskID, freeSlot, sys.PSW_Task.Size, sys.PSW_Task.BasePriority,
 	)
-
 	return true
 }
 
 // ============================================================
-// Поиск READY-процесса с максимальным итоговым приоритетом
-//
-// Effective = BasePriority + DynPriority
+// Поиск READY-процесса с максимальным приоритетом
 // ============================================================
 
 func (sys *SystemModel) FindHighestPriorityReadyProcess() int {
@@ -262,20 +266,15 @@ func (sys *SystemModel) FindHighestPriorityReadyProcess() int {
 
 	for i := 0; i < len(sys.ProcessTable); i++ {
 		proc := &sys.ProcessTable[i]
-
 		if proc.State != StateReady {
 			continue
 		}
-
-		effectivePriority := sys.EffectivePriority(proc)
-
-		// Выбираем максимальный итоговый приоритет
-		if effectivePriority > bestPriority {
-			bestPriority = effectivePriority
+		ep := sys.EffectivePriority(proc)
+		if ep > bestPriority {
+			bestPriority = ep
 			bestIdx = i
 		}
 	}
-
 	return bestIdx
 }
 
@@ -288,23 +287,14 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
 		return false
 	}
 
-	// Ищем процесс с максимальным:
-	// BasePriority + DynPriority
 	bestIdx := sys.FindHighestPriorityReadyProcess()
-
 	if bestIdx == -1 {
 		return false
 	}
 
 	proc := &sys.ProcessTable[bestIdx]
-
-	// Переводим процесс в Active
 	proc.State = StateActive
-
-	// Когда процесс получил CPU,
-	// динамическую надбавку за ожидание сбрасываем
 	proc.DynPriority = 0
-
 	proc.QuantumUsed = 0
 
 	cpu.ActiveProcID = bestIdx
@@ -312,14 +302,9 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
 	cpu.IsBusy = true
 
 	sys.LastAction = fmt.Sprintf(
-		"ЦП #%d: процесс #%d запущен (Base=%d, Dyn=%d, Effective=%d)",
-		cpu.ID,
-		proc.TaskID,
-		proc.BasePriority,
-		proc.DynPriority,
-		sys.EffectivePriority(proc),
+		"ЦП #%d: процесс #%d запущен (Effective=%d)",
+		cpu.ID, proc.TaskID, sys.EffectivePriority(proc),
 	)
-
 	return true
 }
 
@@ -333,27 +318,16 @@ func (sys *SystemModel) FinishProcess(cpu *CPU) {
 	}
 
 	proc := &sys.ProcessTable[cpu.ActiveProcID]
-
 	taskID := proc.TaskID
 
-	sys.LastAction = fmt.Sprintf(
-		"Процесс #%d завершён на ЦП #%d",
-		taskID,
-		cpu.ID,
-	)
-
-	// Освобождаем память
 	sys.FreeMemory += proc.Size
+	sys.ProcessTable[cpu.ActiveProcID] = PSW{State: StateAbsent}
 
-	// Освобождаем слот
-	sys.ProcessTable[cpu.ActiveProcID] = PSW{
-		State: StateAbsent,
-	}
-
-	// Освобождаем CPU
 	cpu.ActiveProcID = -1
 	cpu.PC = 0
 	cpu.IsBusy = false
+
+	sys.LastAction = fmt.Sprintf("Процесс #%d завершён на ЦП #%d", taskID, cpu.ID)
 }
 
 // ============================================================
@@ -366,58 +340,35 @@ func (sys *SystemModel) EndQuantum(cpu *CPU) {
 	}
 
 	proc := &sys.ProcessTable[cpu.ActiveProcID]
-
-	// Если процесс уже завершился
 	if proc.PC >= proc.TotalCommands {
 		sys.FinishProcess(cpu)
 		return
 	}
 
 	taskID := proc.TaskID
-	oldEffective := sys.EffectivePriority(proc)
+	oldEff := sys.EffectivePriority(proc)
 
-	// Возвращаем процесс в READY
 	proc.State = StateReady
 	proc.QuantumUsed = 0
 
-	// CPU освобождается
 	cpu.ActiveProcID = -1
 	cpu.PC = 0
 	cpu.IsBusy = false
 
 	sys.LastAction = fmt.Sprintf(
-		"Процесс #%d: квант завершён (Effective=%d), возвращён в Ready",
-		taskID,
-		oldEffective,
+		"Процесс #%d: квант завершён (Effective=%d) → Ready",
+		taskID, oldEff,
 	)
 }
 
 // ============================================================
-// Динамический приоритет
-//
-// Каждый процесс, находящийся в READY,
-// получает +1 к DynPriority за такт ожидания.
-//
-// Ограничиваем динамическую часть сверху 10.
-//
-// Таким образом:
-//
-//     Effective = Base + Dyn
-//
-// Базовый приоритет остаётся постоянным,
-// динамический меняется в зависимости от ожидания.
+// Обновление динамических приоритетов
 // ============================================================
 
 func (sys *SystemModel) UpdateWaitingPriorities() {
 	for i := 0; i < len(sys.ProcessTable); i++ {
 		proc := &sys.ProcessTable[i]
-
-		if proc.State != StateReady {
-			continue
-		}
-
-		// Максимальная динамическая надбавка = 10
-		if proc.DynPriority < 10 {
+		if proc.State == StateReady && proc.DynPriority < 10 {
 			proc.DynPriority++
 		}
 	}
@@ -431,66 +382,33 @@ func (sys *SystemModel) StepSimulation() {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 
-	// Увеличиваем глобальный счетчик
 	sys.GlobalPC++
 
-	// --------------------------------------------------------
-	// Периодически создаём новые процессы
-	// --------------------------------------------------------
-
-	if sys.GlobalPC == 1 || sys.GlobalPC%20 == 0 {
+	// Периодическая генерация новых заданий
+	if sys.GlobalPC == 1 || sys.GlobalPC%15 == 0 {
 		sys.LoadTask()
 	}
 
-	// --------------------------------------------------------
-	// Увеличиваем динамический приоритет ожидающих процессов
-	// --------------------------------------------------------
-
 	sys.UpdateWaitingPriorities()
-
-	// --------------------------------------------------------
-	// Работа трех CPU
-	// --------------------------------------------------------
 
 	for i := 0; i < len(sys.CPUs); i++ {
 		cpu := &sys.CPUs[i]
-
-		// ----------------------------------------------------
-		// Если CPU свободен — выбираем процесс
-		// с максимальным Base + Dyn
-		// ----------------------------------------------------
 
 		if !cpu.IsBusy {
 			sys.DispatchProcess(cpu)
 		}
 
-		// ----------------------------------------------------
-		// Если CPU занят — выполняем одну команду
-		// ----------------------------------------------------
-
 		if cpu.IsBusy && cpu.ActiveProcID != -1 {
 			proc := &sys.ProcessTable[cpu.ActiveProcID]
 
-			// Выполняем одну команду
 			cpu.PC++
 			proc.PC++
-
-			// Увеличиваем использование кванта
 			proc.QuantumUsed++
-
-			// ------------------------------------------------
-			// Проверяем завершение процесса
-			// ------------------------------------------------
 
 			if proc.PC >= proc.TotalCommands {
 				sys.FinishProcess(cpu)
 				continue
 			}
-
-			// ------------------------------------------------
-			// Проверяем завершение кванта
-			// ------------------------------------------------
-
 			if proc.QuantumUsed >= sys.Kvant {
 				sys.EndQuantum(cpu)
 			}
@@ -499,7 +417,7 @@ func (sys *SystemModel) StepSimulation() {
 }
 
 // ============================================================
-// Изменение скорости
+// Изменение / получение скорости
 // ============================================================
 
 func (sys *SystemModel) ChangeSpeed(factor float64) {
@@ -507,76 +425,52 @@ func (sys *SystemModel) ChangeSpeed(factor float64) {
 	defer sys.mu.Unlock()
 
 	newSpeed := sys.Speed * factor
-
 	if newSpeed < 0.1 {
 		newSpeed = 0.1
 	}
-
 	if newSpeed > 1000.0 {
 		newSpeed = 1000.0
 	}
-
 	sys.Speed = newSpeed
 }
-
-// ============================================================
-// Получение скорости
-// ============================================================
 
 func (sys *SystemModel) GetSpeed() float64 {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
-
 	return sys.Speed
 }
-
-// ============================================================
-// Получение состояния системы
-// ============================================================
 
 func (sys *SystemModel) GetRunning() bool {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
-
 	return sys.IsRunning
 }
 
 // ============================================================
-// Включение cbreak/raw режима терминала
+// Терминал
 // ============================================================
 
 func EnableRawMode() {
 	if runtime.GOOS == "windows" {
 		return
 	}
-
 	cb := exec.Command("stty", "cbreak", "-echo")
 	cb.Stdin = os.Stdin
-
 	_ = cb.Run()
 }
-
-// ============================================================
-// Восстановление терминала
-// ============================================================
 
 func CleanupTerminal() {
 	if runtime.GOOS != "windows" {
 		sane := exec.Command("stty", "sane")
 		sane.Stdin = os.Stdin
-
 		_ = sane.Run()
-
-		// Выход из альтернативного экрана
 		fmt.Print("\033[?1049l")
 	}
-
-	// Показать курсор
 	fmt.Print("\033[?25h")
 }
 
 // ============================================================
-// Отрисовка интерфейса
+// 12. Индикация слов состояний процессов + формулы памяти
 // ============================================================
 
 func (sys *SystemModel) RenderUI() {
@@ -584,111 +478,63 @@ func (sys *SystemModel) RenderUI() {
 	defer sys.mu.Unlock()
 
 	var b strings.Builder
-
-	// Переход в левый верхний угол
 	b.WriteString("\033[1;1H")
 
 	printlnLine := func(s string) {
 		b.WriteString(s)
 		b.WriteString("\033[K\n")
 	}
-
 	printfLine := func(format string, a ...interface{}) {
 		b.WriteString(fmt.Sprintf(format, a...))
 		b.WriteString("\033[K\n")
 	}
 
-	printlnLine("=========================================================================")
-
-	printfLine(
-		"МОДЕЛЬ ОПЕРАЦИОННОЙ СИСТЕМЫ | Вариант 5 (3 ЦП)",
-	)
+	occupied := sys.TotalMemory - sys.FreeMemory
+	canLoad := sys.FreeMemory > 0 // упрощённо; реальная проверка — в HasFreeMemory
 
 	printlnLine("=========================================================================")
+	printfLine("МОДЕЛЬ ОС | Лаб.2 Генерация и загрузка | Вариант 25")
+	printlnLine("=========================================================================")
 
-	printfLine(
-		"[Системный PC]: %-10d | [Скорость]: %-6.1f тактов/сек",
-		sys.GlobalPC,
-		sys.Speed,
-	)
+	printfLine("[Системный PC]: %-10d | [Скорость]: %-6.1f тактов/сек",
+		sys.GlobalPC, sys.Speed)
 
-	printfLine(
-		"[Память ОЗУ]  : %d / %d (Свободно: %d)",
-		sys.TotalMemory-sys.FreeMemory,
-		sys.TotalMemory,
-		sys.FreeMemory,
-	)
+	// Формулы занятой и свободной памяти
+	printfLine("[Память ОЗУ]  : занято = %d, свободно = %d, всего = %d",
+		occupied, sys.FreeMemory, sys.TotalMemory)
+	printfLine("               занято = TotalMemory - FreeMemory = %d - %d = %d",
+		sys.TotalMemory, sys.FreeMemory, occupied)
+	printfLine("[Можно загрузить новое задание]: %v  (FreeMemory > 0 и есть свободный слот)",
+		canLoad && hasFreeSlot(sys))
 
 	printlnLine("-------------------------------------------------------------------------")
-
-	// =========================================================
-	// CPU
-	// =========================================================
-
 	printlnLine("СОСТОЯНИЕ ЦЕНТРАЛЬНЫХ ПРОЦЕССОРОВ (ЦП):")
 
 	for _, cpu := range sys.CPUs {
 		status := "Ожидание"
-
 		if cpu.IsBusy && cpu.ActiveProcID != -1 {
 			proc := &sys.ProcessTable[cpu.ActiveProcID]
-
-			status = fmt.Sprintf(
-				"Работа (Процесс #%d, PC=%d, Effective=%d)",
-				proc.TaskID,
-				cpu.PC,
-				sys.EffectivePriority(proc),
-			)
+			status = fmt.Sprintf("Работа (Процесс #%d, PC=%d, Effective=%d)",
+				proc.TaskID, cpu.PC, sys.EffectivePriority(proc))
 		}
-
-		printfLine(
-			"   ЦП #%d: %s",
-			cpu.ID,
-			status,
-		)
+		printfLine("   ЦП #%d: %s", cpu.ID, status)
 	}
 
 	printlnLine("-------------------------------------------------------------------------")
+	printlnLine("ТАБЛИЦА ПРОЦЕССОВ (PSW) — номер, ID, PC, код состояния:")
 
-	// =========================================================
-	// Таблица процессов
-	// =========================================================
+	printfLine(" %-5s %-8s %-12s %-10s %-8s %-6s %-6s %-6s",
+		"Слот", "TaskID", "Состояние", "PC/Total", "Размер", "Base", "Dyn", "Код")
+	printfLine(" %-5s %-8s %-12s %-10s %-8s %-6s %-6s %-6s",
+		"", "", "", "", "", "", "", "ст.")
 
-	printlnLine("ТАБЛИЦА ПРОЦЕССОВ (PSW):")
-
-	printfLine(
-		" %-4s %-8s %-12s %-12s %-8s %-8s %-8s",
-		"Слот",
-		"TaskID",
-		"Состояние",
-		"PC/Total",
-		"Размер",
-		"Base",
-		"Dyn",
-	)
-
-	printfLine(
-		" %-4s %-8s %-12s %-12s %-8s %-8s %-8s",
-		"",
-		"",
-		"",
-		"",
-		"",
-		"",
-		"Effective",
-	)
-
-	renderedRows := 0
-
+	rendered := 0
 	for i, proc := range sys.ProcessTable {
 		if proc.State == StateAbsent {
 			continue
 		}
-
-		renderedRows++
-
-		printfLine(
-			" [%02d] %-8d %-12s %d/%-7d %-8d %-8d %-8d",
+		rendered++
+		printfLine(" [%02d] %-8d %-12s %d/%-7d %-8d %-6d %-6d %-6d",
 			i,
 			proc.TaskID,
 			proc.State,
@@ -697,39 +543,34 @@ func (sys *SystemModel) RenderUI() {
 			proc.Size,
 			proc.BasePriority,
 			proc.DynPriority,
+			StateCode(proc.State),
 		)
-
-		// Отдельной строкой итоговый приоритет
-		printfLine(
-			"       Effective Priority = %d",
-			sys.EffectivePriority(&proc),
-		)
+		printfLine("       Effective = Base + Dyn = %d + %d = %d",
+			proc.BasePriority, proc.DynPriority, sys.EffectivePriority(&proc))
 	}
 
-	// Очищаем оставшиеся строки
-	for i := renderedRows; i < 6; i++ {
+	// Очистка лишних строк
+	for i := rendered; i < 6; i++ {
 		b.WriteString("\033[K\n")
 		b.WriteString("\033[K\n")
 	}
 
 	printlnLine("=========================================================================")
-
-	printlnLine(
-		"Приоритет: Effective = Base + Dyn | Квант = 10 команд",
-	)
-
-	printlnLine(
-		"[+] Скорость +10% | [-] Скорость -10% | [q] Выход",
-	)
-
+	printlnLine("Приоритет: Effective = Base + Dyn | Квант = 10 команд")
+	printlnLine("[+] Скорость +10% | [-] Скорость -10% | [q] Выход")
 	printlnLine("=========================================================================")
-
-	printfLine(
-		"[Статус команды]: %s",
-		sys.LastAction,
-	)
+	printfLine("[Статус]: %s", sys.LastAction)
 
 	fmt.Print(b.String())
+}
+
+func hasFreeSlot(sys *SystemModel) bool {
+	for _, p := range sys.ProcessTable {
+		if p.State == StateAbsent {
+			return true
+		}
+	}
+	return false
 }
 
 // ============================================================
@@ -738,50 +579,30 @@ func (sys *SystemModel) RenderUI() {
 
 func (sys *SystemModel) HandleInput() {
 	buf := make([]byte, 1)
-
 	for {
 		if !sys.GetRunning() {
 			return
 		}
-
 		n, err := os.Stdin.Read(buf)
-
 		if err != nil || n == 0 {
 			continue
 		}
-
 		char := string(buf[0])
-
 		switch char {
-
 		case "+":
-
 			sys.ChangeSpeed(1.10)
-
 			sys.mu.Lock()
-			sys.LastAction = fmt.Sprintf(
-				"Нажато '+' -> Скорость увеличена до %.1f тактов/сек",
-				sys.Speed,
-			)
+			sys.LastAction = fmt.Sprintf("Скорость увеличена до %.1f", sys.Speed)
 			sys.mu.Unlock()
-
 		case "-":
-
 			sys.ChangeSpeed(0.90)
-
 			sys.mu.Lock()
-			sys.LastAction = fmt.Sprintf(
-				"Нажато '-' -> Скорость уменьшена до %.1f тактов/сек",
-				sys.Speed,
-			)
+			sys.LastAction = fmt.Sprintf("Скорость уменьшена до %.1f", sys.Speed)
 			sys.mu.Unlock()
-
 		case "q", "Q":
-
 			sys.mu.Lock()
 			sys.IsRunning = false
 			sys.mu.Unlock()
-
 			return
 		}
 	}
@@ -792,96 +613,52 @@ func (sys *SystemModel) HandleInput() {
 // ============================================================
 
 func main() {
-
-	// --------------------------------------------------------
-	// Аргументы командной строки
-	// --------------------------------------------------------
-
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
-
-		if arg == "/?" ||
-			arg == "-help" ||
-			arg == "--help" {
-
+		if arg == "/?" || arg == "-help" || arg == "--help" {
 			PrintHelp()
 			return
 		}
 	}
 
-	// --------------------------------------------------------
-	// Настройка терминала
-	// --------------------------------------------------------
-
 	EnableRawMode()
-
 	if runtime.GOOS != "windows" {
 		fmt.Print("\033[?1049h")
 	}
-
-	// Скрываем курсор
 	fmt.Print("\033[?25l")
 
-	// --------------------------------------------------------
-	// Обработка Ctrl+C / SIGTERM
-	// --------------------------------------------------------
-
 	sigChan := make(chan os.Signal, 1)
-
-	signal.Notify(
-		sigChan,
-		os.Interrupt,
-		syscall.SIGTERM,
-	)
-
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-
 		CleanupTerminal()
-
 		fmt.Println("\nМоделирование завершено.")
 		os.Exit(0)
 	}()
 
-	// --------------------------------------------------------
-	// Создание модели
-	// --------------------------------------------------------
-
 	model := NewSystemModel()
 
-	// --------------------------------------------------------
-	// Запуск обработки клавиатуры
-	// --------------------------------------------------------
+	// ============================================================
+	// 11. Цикл загрузки заданий для начала моделирования
+	// ============================================================
+	fmt.Println("Начальная загрузка заданий...")
+	for i := 0; i < 4; i++ { // загружаем несколько заданий сразу
+		if !model.LoadTask() {
+			break
+		}
+	}
 
 	go model.HandleInput()
 
-	// --------------------------------------------------------
-	// Главный цикл
-	// --------------------------------------------------------
-
 	for model.GetRunning() {
-
 		model.StepSimulation()
-
 		model.RenderUI()
 
 		currentSpeed := model.GetSpeed()
-
-		// Интервал между тактами
-		delay := time.Duration(
-			1000.0/currentSpeed,
-		) * time.Millisecond
-
+		delay := time.Duration(1000.0/currentSpeed) * time.Millisecond
 		time.Sleep(delay)
 	}
 
-	// --------------------------------------------------------
-	// Завершение
-	// --------------------------------------------------------
-
 	CleanupTerminal()
-
-	fmt.Println(
-		"\nМоделирование завершено по команде оператора ('q').",
-	)
+	fmt.Println("\nМоделирование завершено по команде оператора ('q').")
 }
