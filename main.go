@@ -53,7 +53,7 @@ type PSW struct {
     TotalCommands int // Общее количество команд
 
     BasePriority int // Постоянный базовый приоритет
-    DynPriority  int // Динамическая надбавка к базовому приоритету
+    DynPriority  int // Динамическая составляющая приоритета
 
     QuantumUsed int // Сколько команд выполнено в текущем кванте
 
@@ -161,7 +161,7 @@ func NewSystemModel() *SystemModel {
 func PrintHelp() {
     fmt.Println("=========================================================================")
     fmt.Println("  Модель ОС: Распределение времени ЦП")
-    fmt.Println("  Вариант 5: 3 ЦП, базовые и динамические приоритеты")
+    fmt.Println("  Вариант 5: 3 ЦП, относительные и динамические приоритеты")
     fmt.Println("=========================================================================")
     fmt.Println("Запуск:")
     fmt.Println("  go run main.go       — Запуск моделирования")
@@ -281,7 +281,7 @@ func (sys *SystemModel) LoadTask() bool {
 // Effective = BasePriority + DynPriority
 // ============================================================
 
-func (sys *SystemModel) FindHighestPriorityReadyProcess() int {
+func (sys *SystemModel) GetNextProcessForCPU() int {
     bestIdx := -1
     bestPriority := -1
 
@@ -295,13 +295,27 @@ func (sys *SystemModel) FindHighestPriorityReadyProcess() int {
         effectivePriority := sys.EffectivePriority(proc)
 
         // Выбираем максимальный итоговый приоритет
-        if effectivePriority > bestPriority {
+        if bestIdx == -1 || effectivePriority > bestPriority {
             bestPriority = effectivePriority
             bestIdx = i
         }
     }
 
     return bestIdx
+}
+
+// Сохранение аппаратного счётчика команд в PSW активного процесса.
+func (sys *SystemModel) SaveProcessState(cpu *CPU) {
+    if cpu.ActiveProcID != -1 {
+        sys.ProcessTable[cpu.ActiveProcID].PC = cpu.PC
+    }
+}
+
+// Восстановление счётчика команд выбранного процесса на свободном ЦП.
+func (sys *SystemModel) RestoreProcessState(cpu *CPU, procIdx int) {
+    cpu.ActiveProcID = procIdx
+    cpu.PC = sys.ProcessTable[procIdx].PC
+    cpu.IsBusy = true
 }
 
 // ============================================================
@@ -315,7 +329,7 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
 
     // Ищем процесс с максимальным:
     // BasePriority + DynPriority
-    bestIdx := sys.FindHighestPriorityReadyProcess()
+    bestIdx := sys.GetNextProcessForCPU()
 
     if bestIdx == -1 {
         return false
@@ -326,15 +340,10 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
     // Переводим процесс в Active
     proc.State = StateActive
 
-    // Когда процесс получил CPU,
-    // динамическую надбавку за ожидание сбрасываем
-    proc.DynPriority = 0
-
+    // При повторном назначении сохраняем накопленное снижение приоритета.
     proc.QuantumUsed = 0
 
-    cpu.ActiveProcID = bestIdx
-    cpu.PC = proc.PC
-    cpu.IsBusy = true
+    sys.RestoreProcessState(cpu, bestIdx)
 
     sys.LastAction = fmt.Sprintf(
         "ЦП #%d: процесс #%d запущен (Base=%d, Dyn=%d, Effective=%d)",
@@ -392,6 +401,9 @@ func (sys *SystemModel) EndQuantum(cpu *CPU) {
 
     proc := &sys.ProcessTable[cpu.ActiveProcID]
 
+    sys.SaveProcessState(cpu)
+    sys.UpdateProcessPriority(proc)
+
     // Если процесс уже завершился
     if proc.PC >= proc.TotalCommands {
         sys.FinishProcess(cpu)
@@ -420,30 +432,25 @@ func (sys *SystemModel) EndQuantum(cpu *CPU) {
 // ============================================================
 // Динамический приоритет
 //
-// Каждый процесс, находящийся в READY,
-// получает +1 к DynPriority за такт ожидания.
-//
-// Ограничиваем динамическую часть сверху 10.
+// За каждый использованный квант приоритет процесса уменьшается на 1.
 //
 // Таким образом:
 //
 //     Effective = Base + Dyn
 //
-// Базовый приоритет остаётся постоянным,
-// динамический меняется в зависимости от ожидания.
+// BasePriority постоянен; DynPriority = -(PC / Kvant).
 // ============================================================
 
-func (sys *SystemModel) UpdateWaitingPriorities() {
-    for i := 0; i < len(sys.ProcessTable); i++ {
-        proc := &sys.ProcessTable[i]
+func (sys *SystemModel) UpdateProcessPriority(proc *PSW) {
+    proc.DynPriority = -(proc.PC / sys.Kvant)
+}
 
-        if proc.State != StateReady {
-            continue
-        }
-
-        // Максимальная динамическая надбавка = 10
-        if proc.DynPriority < 10 {
-            proc.DynPriority++
+// Назначение процессов выполняется до исполнения команд всех трёх ЦП.
+// Поэтому один процесс не выполняет несколько команд за один системный такт.
+func (sys *SystemModel) DispatchReadyProcesses() {
+    for i := range sys.CPUs {
+        if !sys.CPUs[i].IsBusy {
+            sys.DispatchProcess(&sys.CPUs[i])
         }
     }
 }
@@ -468,10 +475,10 @@ func (sys *SystemModel) StepSimulation() {
     }
 
     // --------------------------------------------------------
-    // Увеличиваем динамический приоритет ожидающих процессов
+    // Назначаем процессы на все свободные ЦП до выполнения команд
     // --------------------------------------------------------
 
-    sys.UpdateWaitingPriorities()
+    sys.DispatchReadyProcesses()
 
     // --------------------------------------------------------
     // Работа трех CPU
@@ -479,15 +486,6 @@ func (sys *SystemModel) StepSimulation() {
 
     for i := 0; i < len(sys.CPUs); i++ {
         cpu := &sys.CPUs[i]
-
-        // ----------------------------------------------------
-        // Если CPU свободен — выбираем процесс
-        // с максимальным Base + Dyn
-        // ----------------------------------------------------
-
-        if !cpu.IsBusy {
-            sys.DispatchProcess(cpu)
-        }
 
         // ----------------------------------------------------
         // Если CPU занят — выполняем одну команду
@@ -498,7 +496,8 @@ func (sys *SystemModel) StepSimulation() {
 
             // Выполняем одну команду
             cpu.PC++
-            proc.PC++
+            sys.SaveProcessState(cpu)
+            sys.UpdateProcessPriority(proc)
 
             // Увеличиваем использование кванта
             proc.QuantumUsed++
@@ -509,6 +508,7 @@ func (sys *SystemModel) StepSimulation() {
 
             if proc.PC >= proc.TotalCommands {
                 sys.FinishProcess(cpu)
+                sys.DispatchProcess(cpu)
                 continue
             }
 
@@ -518,6 +518,7 @@ func (sys *SystemModel) StepSimulation() {
 
             if proc.QuantumUsed >= sys.Kvant {
                 sys.EndQuantum(cpu)
+                sys.DispatchProcess(cpu)
             }
         }
     }
@@ -659,7 +660,8 @@ func (sys *SystemModel) RenderUI() {
             proc := &sys.ProcessTable[cpu.ActiveProcID]
 
             status = fmt.Sprintf(
-                "Работа (Процесс #%d, PC=%d, Effective=%d)",
+                "Работа (Слот=%02d, TaskID=%d, PC=%d, Effective=%d)",
+                cpu.ActiveProcID,
                 proc.TaskID,
                 cpu.PC,
                 sys.EffectivePriority(proc),
