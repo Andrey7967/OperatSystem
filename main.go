@@ -24,6 +24,7 @@ const (
     StateReady   ProcessState = "Готов"
     StateActive  ProcessState = "Активен"
     StateBlocked ProcessState = "Блокирован"
+     StateInitIO  ProcessState = "Инициализация IO"
 )
 
 // Числовой код состояния для индикации PSW.
@@ -37,9 +38,27 @@ func (state ProcessState) Code() int {
         return 2
     case StateBlocked:
         return 3
+    case StateInitIO:
+        return 4
     default:
         return -1
     }
+}
+
+// Команда использует локальные адреса в памяти своего процесса.
+type OperationCode string
+
+const (
+    OpCalculate OperationCode = "ADD"
+    OpIO        OperationCode = "IO"
+    OpExit      OperationCode = "EXIT"
+)
+
+type Command struct {
+    Code    OperationCode
+    Address1 int
+    Address2 int
+    ResultAddress int
 }
 
 // ============================================================
@@ -57,6 +76,10 @@ type PSW struct {
 
     QuantumUsed int // Сколько команд выполнено в текущем кванте
 
+    Memory      []int // Память процесса, Size ячеек
+    LastCommand Command // Последняя выполненная команда
+    IORemaining int // Оставшееся время операции ввода/вывода
+
     State ProcessState // Состояние процесса
 }
 
@@ -69,6 +92,7 @@ type CPU struct {
     ActiveProcID int
     PC           int
     IsBusy       bool
+    LastCommand  OperationCode // Тип последней команды на этом ЦП
 }
 
 // ============================================================
@@ -83,6 +107,8 @@ type SystemModel struct {
 
     Speed float64
     Kvant int
+    IOProbability int // Процент IO среди команд до EXIT
+    NInOut        int // Длительность IO в тактах после инициализации
 
     GlobalPC uint64
 
@@ -114,6 +140,8 @@ func NewSystemModel() *SystemModel {
 
         Speed: 10.0,
         Kvant: 10,
+        IOProbability: 20,
+        NInOut: 3,
 
         GlobalPC: 0,
 
@@ -259,6 +287,10 @@ func (sys *SystemModel) LoadTask() bool {
     sys.FreeMemory -= newTask.Size
 
     // Загружаем процесс
+    newTask.Memory = make([]int, newTask.Size)
+    for i := range newTask.Memory {
+        newTask.Memory[i] = newTask.TaskID + i
+    }
     sys.ProcessTable[freeSlot] = newTask
 
     // Генерируем следующее задание только после успешной загрузки текущего.
@@ -455,6 +487,144 @@ func (sys *SystemModel) DispatchReadyProcesses() {
     }
 }
 
+// Вместо чтения машинного кода генерируем очередную команду процесса.
+// Последняя команда задания всегда EXIT и входит в TotalCommands.
+func (sys *SystemModel) GenerateCommand(cpu *CPU) Command {
+    proc := &sys.ProcessTable[cpu.ActiveProcID]
+    if cpu.PC >= proc.TotalCommands-1 {
+        return Command{Code: OpExit}
+    }
+    if sys.RNG.Intn(100) < sys.IOProbability {
+        return Command{Code: OpIO}
+    }
+    size := len(proc.Memory)
+    if size == 0 {
+        return Command{Code: OpCalculate, Address1: -1}
+    }
+    return Command{
+        Code: OpCalculate,
+        Address1: (cpu.PC + 1) % size,
+        Address2: (cpu.PC + 2) % size,
+        ResultAddress: cpu.PC % size,
+    }
+}
+
+func (sys *SystemModel) DecodeCommand(command Command) (OperationCode, int, int, int) {
+    return command.Code, command.Address1, command.Address2, command.ResultAddress
+}
+
+func (sys *SystemModel) ReadOperand(proc *PSW, address int) (int, error) {
+    if address < 0 || address >= len(proc.Memory) {
+        return 0, fmt.Errorf("адрес %d вне памяти процесса #%d", address, proc.TaskID)
+    }
+    return proc.Memory[address], nil
+}
+
+func (sys *SystemModel) WriteResult(proc *PSW, address, value int) error {
+    if address < 0 || address >= len(proc.Memory) {
+        return fmt.Errorf("адрес %d вне памяти процесса #%d", address, proc.TaskID)
+    }
+    proc.Memory[address] = value
+    return nil
+}
+
+// Контекст сохраняется до освобождения ЦП. IO выполняется без участия ЦП.
+func (sys *SystemModel) InitializeIO(cpu *CPU) {
+    sys.SaveProcessState(cpu)
+    proc := &sys.ProcessTable[cpu.ActiveProcID]
+    proc.State = StateInitIO
+    proc.IORemaining = sys.NInOut
+    proc.QuantumUsed = 0
+    sys.LastAction = fmt.Sprintf("Процесс #%d: инициализация IO, %d такта", proc.TaskID, sys.NInOut)
+    cpu.ActiveProcID = -1
+    cpu.PC = 0
+    cpu.IsBusy = false
+}
+
+// Минимальная модель независимой IO-операции каждого процесса.
+// Первый такт после обращения отведён инициализации; затем NInOut тактов IO.
+func (sys *SystemModel) StepIO() {
+    for i := range sys.ProcessTable {
+        proc := &sys.ProcessTable[i]
+        if proc.State == StateInitIO {
+            proc.State = StateBlocked
+        } else if proc.State == StateBlocked {
+            proc.IORemaining--
+            if proc.IORemaining <= 0 {
+                proc.IORemaining = 0
+                proc.State = StateReady
+                sys.LastAction = fmt.Sprintf("Процесс #%d: IO завершён, состояние Готов", proc.TaskID)
+            }
+        }
+    }
+}
+
+func (sys *SystemModel) DoOperation(cpu *CPU, code OperationCode, operand1, operand2 int) (int, error) {
+    switch code {
+    case OpCalculate:
+        return operand1 + operand2, nil
+    case OpIO:
+        sys.InitializeIO(cpu)
+    case OpExit:
+        sys.FinishProcess(cpu)
+        // После освобождения памяти загрузить столько заданий, сколько помещается.
+        for sys.LoadTask() {
+        }
+    default:
+        return 0, fmt.Errorf("неизвестная команда %q", code)
+    }
+    return 0, nil
+}
+
+// Ошибочная команда или адрес приводят к выгрузке процесса, а не к panic.
+func (sys *SystemModel) AbortProcess(cpu *CPU, err error) {
+    taskID := sys.ProcessTable[cpu.ActiveProcID].TaskID
+    sys.FinishProcess(cpu)
+    for sys.LoadTask() {
+    }
+    sys.LastAction = fmt.Sprintf("Процесс #%d удалён по ошибке: %s", taskID, err)
+}
+
+func (sys *SystemModel) ExecuteCommand(cpu *CPU) {
+    if !cpu.IsBusy || cpu.ActiveProcID == -1 {
+        return
+    }
+    proc := &sys.ProcessTable[cpu.ActiveProcID]
+    command := sys.GenerateCommand(cpu)
+    // Длина команды равна одной ячейке: PC указывает на следующую команду.
+    cpu.PC++
+    sys.SaveProcessState(cpu)
+    sys.UpdateProcessPriority(proc)
+    proc.QuantumUsed++
+    proc.LastCommand = command
+    cpu.LastCommand = command.Code
+    code, address1, address2, resultAddress := sys.DecodeCommand(command)
+    operand1, operand2 := 0, 0
+    var err error
+    if code == OpCalculate {
+        operand1, err = sys.ReadOperand(proc, address1)
+        if err == nil {
+            operand2, err = sys.ReadOperand(proc, address2)
+        }
+    }
+    if err != nil {
+        sys.AbortProcess(cpu, err)
+        return
+    }
+    result, err := sys.DoOperation(cpu, code, operand1, operand2)
+    if err == nil && code == OpCalculate {
+        err = sys.WriteResult(proc, resultAddress, result)
+    }
+    if err != nil {
+        sys.AbortProcess(cpu, err)
+        return
+    }
+    if code == OpCalculate {
+        sys.LastAction = fmt.Sprintf("Процесс #%d: ADD M[%d] = %d + %d = %d",
+            proc.TaskID, resultAddress, operand1, operand2, result)
+    }
+}
+
 // ============================================================
 // Один такт моделирования
 // ============================================================
@@ -465,6 +635,8 @@ func (sys *SystemModel) StepSimulation() {
 
     // Увеличиваем глобальный счетчик
     sys.GlobalPC++
+
+    sys.StepIO()
 
     // --------------------------------------------------------
     // Периодически создаём новые процессы
@@ -494,13 +666,11 @@ func (sys *SystemModel) StepSimulation() {
         if cpu.IsBusy && cpu.ActiveProcID != -1 {
             proc := &sys.ProcessTable[cpu.ActiveProcID]
 
-            // Выполняем одну команду
-            cpu.PC++
-            sys.SaveProcessState(cpu)
-            sys.UpdateProcessPriority(proc)
-
-            // Увеличиваем использование кванта
-            proc.QuantumUsed++
+            // Полный цикл генерации, разбора и исполнения одной команды.
+            sys.ExecuteCommand(cpu)
+            if !cpu.IsBusy {
+                continue
+            }
 
             // ------------------------------------------------
             // Проверяем завершение процесса
@@ -508,7 +678,6 @@ func (sys *SystemModel) StepSimulation() {
 
             if proc.PC >= proc.TotalCommands {
                 sys.FinishProcess(cpu)
-                sys.DispatchProcess(cpu)
                 continue
             }
 
@@ -518,10 +687,11 @@ func (sys *SystemModel) StepSimulation() {
 
             if proc.QuantumUsed >= sys.Kvant {
                 sys.EndQuantum(cpu)
-                sys.DispatchProcess(cpu)
             }
         }
     }
+    // Новые назначения исполнят первую команду только в следующем такте.
+    sys.DispatchReadyProcesses()
 }
 
 // ============================================================
@@ -669,9 +839,10 @@ func (sys *SystemModel) RenderUI() {
         }
 
         printfLine(
-            "   ЦП #%d: %s",
+            "   ЦП #%d: %s | Последняя команда: %s",
             cpu.ID,
             status,
+            cpu.LastCommand,
         )
     }
 
@@ -730,8 +901,10 @@ func (sys *SystemModel) RenderUI() {
 
         // Отдельной строкой итоговый приоритет
         printfLine(
-            "       Effective Priority = %d",
+            "       Effective=%d | Команда=%s | IO осталось=%d",
             sys.EffectivePriority(&proc),
+            proc.LastCommand.Code,
+            proc.IORemaining,
         )
     }
 
@@ -743,9 +916,8 @@ func (sys *SystemModel) RenderUI() {
 
     printlnLine("=========================================================================")
 
-    printlnLine(
-        "Приоритет: Effective = Base + Dyn | Квант = 10 команд",
-    )
+    printfLine("Effective = Base + Dyn | Квант = %d | IO = %d%%, %d такта",
+        sys.Kvant, sys.IOProbability, sys.NInOut)
 
     printlnLine(
         "[+] Скорость +10% | [-] Скорость -10% | [q] Выход",
