@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"os"
@@ -59,6 +60,8 @@ type Command struct {
 	Address1      int
 	Address2      int
 	ResultAddress int
+	Direction     IODirection
+	IOCount       int
 }
 
 // ============================================================
@@ -88,12 +91,14 @@ type PSW struct {
 // ============================================================
 
 type CPU struct {
-	ID           int
-	ActiveProcID int
-	PC           int
-	IsBusy       bool
-	LastCommand  OperationCode // Тип последней команды на этом ЦП
-	SystemProcID int           // 0 либо идентификатор исполняемого системного процесса
+	ID            int
+	ActiveProcID  int
+	PC            int
+	IsBusy        bool
+	LastCommand   OperationCode // Тип последней команды на этом ЦП
+	SystemProcID  int           // 0 либо идентификатор исполняемого системного процесса
+	WaitingGlobal bool
+	PendingAction string
 }
 
 // Отдельная запись системного процесса с собственным счётчиком и состоянием.
@@ -136,9 +141,17 @@ type SystemModel struct {
 	ProcessTable [16]PSW
 	PSW_Task     PSW // Подготовленное задание, ожидающее загрузки
 
-	SystemProcesses          [16]SystemProcess
-	NextSystemID             int
-	CompletedSystemProcesses int
+	SystemProcesses                     [16]SystemProcess
+	NextSystemID                        int
+	CompletedSystemProcesses            int
+	IODevices                           [16]IODevice
+	Interrupts                          []Interrupt
+	InterruptHistory                    []Interrupt
+	RaisedInterrupts, HandledInterrupts int
+	LastInterrupt                       string
+	Transitions                         []StateTransition
+	TGlob, GlobalOwner, GlobalRemaining int
+	GlobalWaiters                       []int
 
 	LastAction string
 
@@ -187,9 +200,10 @@ func NewSystemModel() *SystemModel {
 
 	// Инициализация таблицы процессов
 	for i := range sys.ProcessTable {
-		sys.ProcessTable[i] = PSW{
-			State: StateAbsent,
-		}
+		sys.Process(i, StateAbsent)
+	}
+	for i := range sys.SystemProcesses {
+		sys.Process(len(sys.ProcessTable)+i, StateAbsent)
 	}
 
 	// Первое задание готовим заранее и заполняем память до отказа загрузки.
@@ -210,8 +224,9 @@ func PrintHelp() {
 	fmt.Println("  Вариант 5: 3 ЦП, относительные и динамические приоритеты")
 	fmt.Println("=========================================================================")
 	fmt.Println("Запуск:")
-	fmt.Println("  go run main.go       — Запуск моделирования")
-	fmt.Println("  go run main.go /?    — Вывод справки")
+	fmt.Println("  go run .            — Запуск моделирования")
+	fmt.Println("  go run . /?         — Вывод справки")
+	fmt.Println("  go run . -t-globl=2 — Общие таблицы заняты на 2 такта")
 	fmt.Println()
 	fmt.Println("Директивы:")
 	fmt.Println("  +                    — Увеличить скорость на 10%")
@@ -255,7 +270,7 @@ func (sys *SystemModel) GenerateTask() PSW {
 
 		QuantumUsed: 0,
 
-		State: StateReady,
+		State: StateAbsent,
 	}
 
 	sys.NextTaskID++
@@ -310,6 +325,7 @@ func (sys *SystemModel) LoadTask() bool {
 		newTask.Memory[i] = newTask.TaskID + i
 	}
 	sys.ProcessTable[freeSlot] = newTask
+	sys.Process(freeSlot, StateReady)
 
 	// Генерируем следующее задание только после успешной загрузки текущего.
 	sys.PSW_Task = sys.GenerateTask()
@@ -382,13 +398,18 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
 	bestIdx := sys.GetNextProcessForCPU()
 
 	if bestIdx == -1 {
+		cpu.WaitingGlobal = false
+		sys.CancelGlobalWait(cpu.ID)
 		return false
 	}
 
+	if !sys.TryGlobalAccess(cpu) {
+		return false
+	}
 	proc := &sys.ProcessTable[bestIdx]
 
 	// Переводим процесс в Active
-	proc.State = StateActive
+	sys.Process(bestIdx, StateActive)
 
 	// При повторном назначении сохраняем накопленное снижение приоритета.
 	proc.QuantumUsed = 0
@@ -415,29 +436,13 @@ func (sys *SystemModel) FinishProcess(cpu *CPU) {
 	if cpu.ActiveProcID == -1 {
 		return
 	}
-
-	proc := &sys.ProcessTable[cpu.ActiveProcID]
-
-	taskID := proc.TaskID
-
-	sys.LastAction = fmt.Sprintf(
-		"Процесс #%d завершён на ЦП #%d",
-		taskID,
-		cpu.ID,
-	)
-
-	// Освобождаем память
-	sys.FreeMemory += proc.Size
-
-	// Освобождаем слот
-	sys.ProcessTable[cpu.ActiveProcID] = PSW{
-		State: StateAbsent,
+	if !sys.TryGlobalAccess(cpu) {
+		cpu.PendingAction = "EXIT"
+		return
 	}
-
-	// Освобождаем CPU
-	cpu.ActiveProcID = -1
-	cpu.PC = 0
-	cpu.IsBusy = false
+	taskID := sys.ProcessTable[cpu.ActiveProcID].TaskID
+	sys.RemoveProcess(cpu.ActiveProcID)
+	sys.LastAction = fmt.Sprintf("Процесс #%d завершён на ЦП #%d", taskID, cpu.ID)
 }
 
 // ============================================================
@@ -448,35 +453,19 @@ func (sys *SystemModel) EndQuantum(cpu *CPU) {
 	if cpu.ActiveProcID == -1 {
 		return
 	}
-
-	proc := &sys.ProcessTable[cpu.ActiveProcID]
-
-	sys.SaveProcessState(cpu)
-	sys.UpdateProcessPriority(proc)
-
-	// Если процесс уже завершился
-	if proc.PC >= proc.TotalCommands {
-		sys.FinishProcess(cpu)
+	if !sys.TryGlobalAccess(cpu) {
+		cpu.PendingAction = "QUANTUM"
 		return
 	}
-
-	taskID := proc.TaskID
-	oldEffective := sys.EffectivePriority(proc)
-
-	// Возвращаем процесс в READY
-	proc.State = StateReady
+	proc := &sys.ProcessTable[cpu.ActiveProcID]
+	sys.SaveProcessState(cpu)
+	sys.UpdateProcessPriority(proc)
+	sys.Process(cpu.ActiveProcID, StateReady)
 	proc.QuantumUsed = 0
-
-	// CPU освобождается
 	cpu.ActiveProcID = -1
 	cpu.PC = 0
 	cpu.IsBusy = false
-
-	sys.LastAction = fmt.Sprintf(
-		"Процесс #%d: квант завершён (Effective=%d), возвращён в Ready",
-		taskID,
-		oldEffective,
-	)
+	cpu.PendingAction = ""
 }
 
 // ============================================================
@@ -513,7 +502,11 @@ func (sys *SystemModel) GenerateCommand(cpu *CPU) Command {
 		return Command{Code: OpExit}
 	}
 	if sys.RNG.Intn(100) < sys.IOProbability {
-		return Command{Code: OpIO}
+		direction := IORead
+		if sys.RNG.Intn(2) == 1 {
+			direction = IOWrite
+		}
+		return Command{Code: OpIO, Direction: direction, IOCount: min(len(proc.Memory), max(1, sys.NInOut))}
 	}
 	size := len(proc.Memory)
 	if size == 0 {
@@ -548,8 +541,17 @@ func (sys *SystemModel) WriteResult(proc *PSW, address, value int) error {
 
 // Команда IO порождает системный процесс, который выполнится в этом же такте.
 func (sys *SystemModel) InitializeIO(cpu *CPU) {
+	if !sys.TryGlobalAccess(cpu) {
+		cpu.PendingAction = "IO"
+		return
+	}
+	cpu.PendingAction = ""
 	sys.SaveProcessState(cpu)
 	proc := &sys.ProcessTable[cpu.ActiveProcID]
+	if len(proc.Memory) == 0 {
+		sys.AbortProcess(cpu, fmt.Errorf("нет памяти для IO"))
+		return
+	}
 	freeSlot := -1
 	for i := range sys.SystemProcesses {
 		if sys.SystemProcesses[i].State != StateReady && sys.SystemProcesses[i].State != StateActive {
@@ -565,9 +567,11 @@ func (sys *SystemModel) InitializeIO(cpu *CPU) {
 	sys.SystemProcesses[freeSlot] = SystemProcess{
 		ID: sys.NextSystemID, ParentTaskID: proc.TaskID,
 		ProcessSlot: cpu.ActiveProcID, CPUID: cpu.ID,
-		State: StateReady, CreatedTick: sys.GlobalPC,
+		CreatedTick: sys.GlobalPC,
+		State:       sys.SystemProcesses[freeSlot].State,
 	}
-	proc.State = StateInitIO
+	sys.Process(len(sys.ProcessTable)+freeSlot, StateReady)
+	sys.Process(cpu.ActiveProcID, StateInitIO)
 	proc.QuantumUsed = 0
 	sys.LastAction = fmt.Sprintf("Создан системный процесс #%d: инициализация IO задания #%d", sys.NextSystemID, proc.TaskID)
 	cpu.ActiveProcID = -1
@@ -593,19 +597,18 @@ func (sys *SystemModel) RunSystemProcesses() {
 		if cpu == nil {
 			continue
 		}
-		process.State = StateActive
+		sys.Process(len(sys.ProcessTable)+i, StateActive)
 		cpu.SystemProcID = process.ID
 		cpu.IsBusy = true
 		cpu.PC = process.PC + 1
 		process.PC = cpu.PC
 		parent := &sys.ProcessTable[process.ProcessSlot]
 		if parent.TaskID == process.ParentTaskID && parent.State == StateInitIO {
-			parent.IORemaining = sys.NInOut
-			parent.State = StateBlocked
+			sys.StartIO(process.ProcessSlot, process.CPUID)
 			sys.LastAction = fmt.Sprintf("Системный процесс #%d на ЦП #%d: IO задания #%d запущен, %d такта",
 				process.ID, process.CPUID, parent.TaskID, sys.NInOut)
 		}
-		process.State = StateAbsent
+		sys.Process(len(sys.ProcessTable)+i, StateAbsent)
 		process.FinishedTick = sys.GlobalPC
 		sys.CompletedSystemProcesses++
 		cpu.SystemProcID = 0
@@ -614,20 +617,7 @@ func (sys *SystemModel) RunSystemProcesses() {
 	}
 }
 
-// Ровно NInOut тактов после обращения, без дополнительного такта инициализации.
-func (sys *SystemModel) StepIO() {
-	for i := range sys.ProcessTable {
-		proc := &sys.ProcessTable[i]
-		if proc.State == StateBlocked {
-			proc.IORemaining--
-			if proc.IORemaining <= 0 {
-				proc.IORemaining = 0
-				proc.State = StateReady
-				sys.LastAction = fmt.Sprintf("Процесс #%d: IO завершён, состояние Готов", proc.TaskID)
-			}
-		}
-	}
-}
+// Процессоры IO и прерывания реализованы в interrupts.go.
 
 func (sys *SystemModel) DoOperation(cpu *CPU, code OperationCode, operand1, operand2 int) (int, error) {
 	switch code {
@@ -637,9 +627,7 @@ func (sys *SystemModel) DoOperation(cpu *CPU, code OperationCode, operand1, oper
 		sys.InitializeIO(cpu)
 	case OpExit:
 		sys.FinishProcess(cpu)
-		// После освобождения памяти загрузить столько заданий, сколько помещается.
-		for sys.LoadTask() {
-		}
+
 	default:
 		return 0, fmt.Errorf("неизвестная команда %q", code)
 	}
@@ -650,8 +638,6 @@ func (sys *SystemModel) DoOperation(cpu *CPU, code OperationCode, operand1, oper
 func (sys *SystemModel) AbortProcess(cpu *CPU, err error) {
 	taskID := sys.ProcessTable[cpu.ActiveProcID].TaskID
 	sys.FinishProcess(cpu)
-	for sys.LoadTask() {
-	}
 	sys.LastAction = fmt.Sprintf("Процесс #%d удалён по ошибке: %s", taskID, err)
 }
 
@@ -702,67 +688,41 @@ func (sys *SystemModel) ExecuteCommand(cpu *CPU) {
 func (sys *SystemModel) StepSimulation() {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
-
-	// Увеличиваем глобальный счетчик
 	sys.GlobalPC++
-
-	sys.StepIO()
-
-	// --------------------------------------------------------
-	// Периодически создаём новые процессы
-	// --------------------------------------------------------
-
-	if sys.GlobalPC == 1 || sys.GlobalPC%20 == 0 {
-		sys.LoadTask()
+	sys.StepGlobalAccess()
+	// Начальное назначение — часть инициализации цикла.
+	if sys.GlobalPC == 1 {
+		sys.CheckSystemState()
 	}
-
-	// --------------------------------------------------------
-	// Назначаем процессы на все свободные ЦП до выполнения команд
-	// --------------------------------------------------------
-
-	sys.DispatchReadyProcesses()
-
-	// --------------------------------------------------------
-	// Работа трех CPU
-	// --------------------------------------------------------
-
-	for i := 0; i < len(sys.CPUs); i++ {
+	// 1. Одна пользовательская команда на каждом занятом ЦП.
+	for i := range sys.CPUs {
 		cpu := &sys.CPUs[i]
-
-		// ----------------------------------------------------
-		// Если CPU занят — выполняем одну команду
-		// ----------------------------------------------------
-
-		if cpu.IsBusy && cpu.ActiveProcID != -1 {
-			proc := &sys.ProcessTable[cpu.ActiveProcID]
-
-			// Полный цикл генерации, разбора и исполнения одной команды.
+		if !cpu.IsBusy || cpu.ActiveProcID < 0 {
+			continue
+		}
+		if cpu.WaitingGlobal && cpu.PendingAction == "" && !sys.TryGlobalAccess(cpu) {
+			continue
+		}
+		switch cpu.PendingAction {
+		case "EXIT":
+			sys.FinishProcess(cpu)
+		case "IO":
+			sys.InitializeIO(cpu)
+		case "QUANTUM": // ожидает обработки уже поставленного прерывания
+		default:
 			sys.ExecuteCommand(cpu)
-			if !cpu.IsBusy {
-				continue
-			}
-
-			// ------------------------------------------------
-			// Проверяем завершение процесса
-			// ------------------------------------------------
-
-			if proc.PC >= proc.TotalCommands {
-				sys.FinishProcess(cpu)
-				continue
-			}
-
-			// ------------------------------------------------
-			// Проверяем завершение кванта
-			// ------------------------------------------------
-
-			if proc.QuantumUsed >= sys.Kvant {
-				sys.EndQuantum(cpu)
-			}
 		}
 	}
 	sys.RunSystemProcesses()
-	// Новые назначения исполнят первую команду только в следующем такте.
-	sys.DispatchReadyProcesses()
+	// 2. Работа IO и обработка сигналов устройств.
+	sys.StepIO()
+	sys.HandleInterrupts()
+	// 3. Прерывания по исчерпанию кванта.
+	sys.CheckTimerInterrupts()
+	sys.HandleInterrupts()
+	// 4-5. Проверка состояния, загрузка и новые назначения.
+	sys.CheckSystemState()
+	// 6. Отрисовка вызывается главным циклом после окончания такта.
 }
 
 // ============================================================
@@ -909,6 +869,9 @@ func (sys *SystemModel) RenderUI() {
 			)
 		}
 
+		if cpu.WaitingGlobal {
+			status += fmt.Sprintf(" | Ожидание общих данных: %d такта", sys.GlobalRemaining)
+		}
 		printfLine(
 			"   ЦП #%d: %s | Последняя команда: %s",
 			cpu.ID,
@@ -923,6 +886,24 @@ func (sys *SystemModel) RenderUI() {
 	// Таблица процессов
 	// =========================================================
 
+	printfLine("ОБЩИЕ ДАННЫЕ: T_Globl=%d | Владелец ЦП=%d | Осталось=%d", sys.TGlob, sys.GlobalOwner, sys.GlobalRemaining)
+	printfLine("ПРЕРЫВАНИЯ: создано=%d обработано=%d ожидает=%d", sys.RaisedInterrupts, sys.HandledInterrupts, len(sys.Interrupts))
+	printfLine("Последнее прерывание: %s", sys.LastInterrupt)
+	printlnLine("ПРОЦЕССОРЫ ВВОДА/ВЫВОДА:")
+	for _, device := range sys.IODevices {
+		if device.ID == 0 {
+			continue
+		}
+		status := "Завершён"
+		if device.Active {
+			status = "Работа"
+		} else if device.InterruptPending {
+			status = "Ожидание обработки IRQ"
+		}
+		printfLine("   IO #%d | TaskID=%d | %s | %s | Осталось=%d | Передано=%d/%d | Буфер=%v",
+			device.ID, device.TaskID, device.Direction, status, device.Remaining, device.Transferred, device.Count, device.Buffer)
+	}
+	printlnLine("-------------------------------------------------------------------------")
 	printfLine("СИСТЕМНЫЕ ПРОЦЕССЫ IO: завершено %d", sys.CompletedSystemProcesses)
 	for _, process := range sys.SystemProcesses {
 		if process.ID == 0 {
@@ -1099,6 +1080,15 @@ func main() {
 	// Настройка терминала
 	// --------------------------------------------------------
 
+	options := flag.NewFlagSet("model", flag.ContinueOnError)
+	sharedTicks := options.Int("t-globl", 0, "число тактов монопольного доступа к общим таблицам")
+	if err := options.Parse(os.Args[1:]); err != nil {
+		return
+	}
+	if *sharedTicks < 0 {
+		fmt.Println("t-globl должен быть неотрицательным")
+		return
+	}
 	EnableRawMode()
 
 	if runtime.GOOS != "windows" {
@@ -1134,6 +1124,7 @@ func main() {
 	// --------------------------------------------------------
 
 	model := NewSystemModel()
+	model.TGlob = *sharedTicks
 
 	// --------------------------------------------------------
 	// Запуск обработки клавиатуры

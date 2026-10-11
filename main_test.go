@@ -58,9 +58,15 @@ func TestIOExactDurationMultipleCPUs(t *testing.T) {
 				if elapsed < duration && (p.State != StateBlocked || p.PC != 1 || p.IORemaining != duration-elapsed) {
 					t.Fatalf("duration=%d elapsed=%d: %+v", duration, elapsed, p)
 				}
-				if elapsed == duration && (p.State != StateActive || p.PC != 2 || p.IORemaining != 0) {
+				if elapsed == duration && (p.State != StateActive || p.PC != 1 || p.IORemaining != 0) {
 					t.Fatalf("extra delay duration=%d: %+v", duration, p)
 				}
+			}
+		}
+		sys.StepSimulation()
+		for i := 0; i < 3; i++ {
+			if sys.ProcessTable[i].PC != 2 {
+				t.Fatal("process did not resume in the next CPU phase")
 			}
 		}
 	}
@@ -127,7 +133,7 @@ func TestIOContextAndDuration(t *testing.T) {
 		}
 	}
 	sys.StepSimulation()
-	if p := sys.ProcessTable[0]; p.State != StateActive || p.PC != 2 || p.IORemaining != 0 {
+	if p := sys.ProcessTable[0]; p.State != StateActive || p.PC != 1 || p.IORemaining != 0 {
 		t.Fatal("restore after IO", p)
 	}
 }
