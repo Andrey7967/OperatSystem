@@ -151,13 +151,16 @@ func screenLine(text string) string {
 }
 
 func (sys *SystemModel) DisplayConstantInformation(lines []string) {
-	lines[0] = "МОДЕЛЬ ОС | Лабораторная 7 | Вариант 25 -> 5 | 3 ЦП | Экран 160 x 42 (терминал от 161 x 43)"
+	lines[0] = "МОДЕЛЬ ОС | Лабораторная 8 | Вариант 25 -> 5 | 3 ЦП | Экран 160 x 42 (терминал от 161 x 43)"
 	lines[1] = "Управление: [+] скорость +10%  [-] скорость -10%  [q] выход | В Windows ввод клавиши + Enter"
 	lines[2] = "СИСТЕМА"
+	if sys.Config != nil {
+		lines[2] = fmt.Sprintf("СИСТЕМА | Файл=%s Seed=%d | параметры прочитаны один раз", sys.ConfigPath, sys.Seed)
+	}
 	lines[5] = "НОВОЕ ЗАДАНИЕ (подготовлено, ещё не загружено)"
 	lines[7] = "ЦЕНТРАЛЬНЫЕ ПРОЦЕССОРЫ | Seq: последние 16 назначений, слева старые, справа новые"
 	lines[11] = "ПРОЦЕССЫ | S: 0 отсутствует, 1 готов, 2 активен, 3 блокирован, 4 инициализация IO | M: размер выделенной памяти"
-	lines[12] = "Слот Task S   PC/Всего     M Base  Dyn    P  Q IOrem CMD  A1 A2 AR Dir  Cnt | IO tr/cnt rem buf0 | Tmono Tmulti Dexe% Dready%"
+	lines[12] = "Слот Task S   PC/Всего     M Base  Dyn    P  Q IOrem CMD  A1 A2 AR Dir  Cnt | IO tr/cnt rem buf0 | Tmono Tmulti Dexe% Dready% | IO:%/такты"
 	for slot := 0; slot < 16; slot++ {
 		lines[13+slot] = fmt.Sprintf("[%02d] -", slot)
 	}
@@ -170,6 +173,9 @@ func (sys *SystemModel) DisplayConstantInformation(lines []string) {
 func (sys *SystemModel) DisplaySystemParameters(lines []string) {
 	r, b := sys.QueueLengths()
 	lines[3] = fmt.Sprintf("Такт=%d Скорость=%.1f Квант=%d IO=%d%% ДлительностьIO=%d Память=%d/%d Свободно=%d Готово=%d Блокировано=%d IRQ=%d", sys.GlobalPC, sys.Speed, sys.Kvant, sys.IOProbability, sys.NInOut, sys.TotalMemory-sys.FreeMemory, sys.TotalMemory, sys.FreeMemory, r, b, len(sys.Interrupts))
+	if sys.Config != nil {
+		lines[3] = fmt.Sprintf("Такт=%d Скорость=%.1f Квант=%d IO: параметры каждого задания Память=%d/%d Свободно=%d Готово=%d Блокировано=%d IRQ=%d", sys.GlobalPC, sys.Speed, sys.Kvant, sys.TotalMemory-sys.FreeMemory, sys.TotalMemory, sys.FreeMemory, r, b, len(sys.Interrupts))
+	}
 	lines[4] = fmt.Sprintf("T_Globl=%d ВладелецЦП=%d Осталось=%d ОчередьЦП=%v IRQ создано/принято=%d/%d SYS завершено=%d ЗагрузкаПауза=%t", sys.TGlob, sys.GlobalOwner, sys.GlobalRemaining, sys.GlobalWaiters, sys.RaisedInterrupts, sys.HandledInterrupts, sys.CompletedSystemProcesses, sys.PauseLoad)
 	lines[37] = "Последний IRQ: " + sys.LastInterrupt
 	lines[38] = "Событие: " + sys.LastAction
@@ -178,6 +184,9 @@ func (sys *SystemModel) DisplaySystemParameters(lines []string) {
 func (sys *SystemModel) DisplayNewTaskParameters(lines []string) {
 	p := sys.PSW_Task
 	lines[6] = fmt.Sprintf("TaskID=%d Размер=%d Команд=%d Base=%d Dyn=%d P=%d PC=%d КвантИсп=%d IOrem=%d S=%d Память ещё не выделена", p.TaskID, p.Size, p.TotalCommands, p.BasePriority, p.DynPriority, sys.EffectivePriority(&p), p.PC, p.QuantumUsed, p.IORemaining, p.State.Code())
+	if p.HasTaskParameters {
+		lines[6] += fmt.Sprintf(" IO=%d%% IOтактов=%d", p.IOPercent, p.IODuration)
+	}
 }
 
 func (sys *SystemModel) DisplayCPUParameters(lines []string) {
@@ -202,6 +211,9 @@ func (sys *SystemModel) DisplayProcessParameters(lines []string) {
 			buf = fmt.Sprint(dev.Buffer[0])
 		}
 		lines[13+slot] = fmt.Sprintf("[%02d] %4d %d %4d/%-5d %5d %4d %4d %4d %2d %5d %-4s %2d %2d %2d %-5s %3d | %2d/%-3d %3d %4s | %5d %6d %6.1f %7.1f", slot, p.TaskID, p.State.Code(), p.PC, p.TotalCommands, p.Size, p.BasePriority, p.DynPriority, sys.EffectivePriority(&p), p.QuantumUsed, p.IORemaining, cmd.Code, cmd.Address1, cmd.Address2, cmd.ResultAddress, cmd.Direction, cmd.IOCount, dev.Transferred, dev.Count, dev.Remaining, buf, m.MonoTicks, m.MultiTicks, executionIncrease(m.MonoTicks, m.MultiTicks), 100*average(m.ReadyTicks, m.MultiTicks))
+		if p.HasTaskParameters {
+			lines[13+slot] += fmt.Sprintf(" IO:%d%%/%d", p.IOPercent, p.IODuration)
+		}
 	}
 }
 

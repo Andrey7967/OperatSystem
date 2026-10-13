@@ -82,7 +82,9 @@ type PSW struct {
 	LastCommand Command // Последняя выполненная команда
 	IORemaining int     // Оставшееся время операции ввода/вывода
 
-	State ProcessState // Состояние процесса
+	State                 ProcessState // Состояние процесса
+	IOPercent, IODuration int          // Индивидуальные параметры задания из файла.
+	HasTaskParameters     bool
 }
 
 // ============================================================
@@ -158,6 +160,9 @@ type SystemModel struct {
 	Metrics      [16]ProcessMetrics
 	RNG          *rand.Rand
 	Measurements []TaskMeasurement
+	Config       *ParameterConfig
+	ConfigPath   string
+	Seed         int64
 }
 
 // ============================================================
@@ -169,6 +174,10 @@ func NewSystemModel() *SystemModel {
 }
 
 func NewSystemModelWithSeed(seed int64) *SystemModel {
+	return newSystemModel(seed, nil)
+}
+
+func newSystemModel(seed int64, config *ParameterConfig) *SystemModel {
 	rng := rand.New(rand.NewSource(seed))
 
 	sys := &SystemModel{
@@ -191,7 +200,15 @@ func NewSystemModelWithSeed(seed int64) *SystemModel {
 
 		LastAction: "Ожидание ввода...",
 
-		RNG: rng,
+		RNG:  rng,
+		Seed: seed,
+	}
+	if config != nil {
+		copyConfig := *config
+		sys.Config = &copyConfig
+		p := GenerateSystemParameters(copyConfig, rng)
+		sys.TotalMemory, sys.FreeMemory = p.Memory, p.Memory
+		sys.Speed, sys.Kvant, sys.TGlob = float64(p.Speed), p.Quantum, p.Global
 	}
 
 	// Инициализация 3 процессоров
@@ -233,6 +250,7 @@ func PrintHelp() {
 	fmt.Println("  go run .            — Запуск моделирования")
 	fmt.Println("  go run . /?         — Вывод справки")
 	fmt.Println("  go run . -t-globl=2 — Общие таблицы заняты на 2 такта")
+	fmt.Println("  ЛР8: -params=params.txt -seed=25; файл читается один раз, seed по умолчанию 25")
 	fmt.Println("  go run . -seed=25 -ticks=400 -results=results.csv — Пакетный прогон ЛР7")
 	fmt.Println("  Параметры: -io=20 -n-inout=3 -kvant=10; длительности в модельных тактах")
 	fmt.Println()
@@ -259,6 +277,17 @@ func (sys *SystemModel) EffectivePriority(proc *PSW) int {
 // ============================================================
 
 func (sys *SystemModel) GenerateTask() PSW {
+	if sys.Config != nil {
+		c := sys.Config
+		task := PSW{TaskID: sys.NextTaskID, State: StateAbsent, HasTaskParameters: true,
+			Size:          GenerateParameterValue(c.Ranges[ParamTaskSize], sys.RNG),
+			TotalCommands: GenerateParameterValue(c.Ranges[ParamTaskCommands], sys.RNG),
+			IOPercent:     GenerateParameterValue(c.Ranges[ParamTaskIO], sys.RNG),
+			IODuration:    GenerateParameterValue(c.Ranges[ParamTaskIODuration], sys.RNG),
+			BasePriority:  GenerateParameterValue(c.Ranges[ParamTaskPriority], sys.RNG)}
+		sys.NextTaskID++
+		return task
+	}
 	// Базовый приоритет случайно от 1 до 10
 	basePriority := 1 + sys.RNG.Intn(10)
 
@@ -511,12 +540,13 @@ func (sys *SystemModel) GenerateCommand(cpu *CPU) Command {
 	if cpu.PC >= proc.TotalCommands-1 {
 		return Command{Code: OpExit}
 	}
-	if sys.RNG.Intn(100) < sys.IOProbability {
+	ioPercent, ioDuration := sys.TaskIOParameters(proc)
+	if sys.RNG.Intn(100) < ioPercent {
 		direction := IORead
 		if sys.RNG.Intn(2) == 1 {
 			direction = IOWrite
 		}
-		return Command{Code: OpIO, Direction: direction, IOCount: min(len(proc.Memory), max(1, sys.NInOut))}
+		return Command{Code: OpIO, Direction: direction, IOCount: min(len(proc.Memory), max(1, ioDuration))}
 	}
 	size := len(proc.Memory)
 	if size == 0 {
@@ -615,8 +645,9 @@ func (sys *SystemModel) RunSystemProcesses() {
 		parent := &sys.ProcessTable[process.ProcessSlot]
 		if parent.TaskID == process.ParentTaskID && parent.State == StateInitIO {
 			sys.StartIO(process.ProcessSlot, process.CPUID)
+			_, duration := sys.TaskIOParameters(parent)
 			sys.LastAction = fmt.Sprintf("Системный процесс #%d на ЦП #%d: IO задания #%d запущен, %d такта",
-				process.ID, process.CPUID, parent.TaskID, sys.NInOut)
+				process.ID, process.CPUID, parent.TaskID, duration)
 		}
 		sys.Process(len(sys.ProcessTable)+i, StateAbsent)
 		process.FinishedTick = sys.GlobalPC
@@ -905,7 +936,8 @@ func main() {
 
 	options := flag.NewFlagSet("model", flag.ContinueOnError)
 	sharedTicks := options.Int("t-globl", 0, "число тактов монопольного доступа к общим таблицам")
-	seed := options.Int64("seed", time.Now().UnixNano(), "начальное состояние генератора")
+	seed := options.Int64("seed", 25, "начальное состояние генератора; одинаковое для повторяемости")
+	paramsPath := options.String("params", "params.txt", "текстовый файл диапазонов параметров")
 	ticks := options.Int("ticks", 0, "число тактов пакетного прогона; 0 = интерактивно")
 	ioPercent := options.Int("io", 20, "процент команд IO до EXIT")
 	ioDuration := options.Int("n-inout", 3, "длительность IO в тактах")
@@ -918,8 +950,30 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Требуется: t-globl,ticks >= 0; io = 0..100; n-inout,kvant >= 1")
 		os.Exit(2)
 	}
-	model := NewSystemModelWithSeed(*seed)
-	model.TGlob, model.IOProbability, model.NInOut, model.Kvant = *sharedTicks, *ioPercent, *ioDuration, *quantum
+	config, err := ReadParameterFile(*paramsPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	// Явно заданные ключи переопределяют диапазоны до начальной загрузки.
+	options.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "t-globl":
+			config.Ranges[ParamGlobal] = ParameterRange{*sharedTicks, *sharedTicks, 0}
+		case "io":
+			config.Ranges[ParamTaskIO] = ParameterRange{*ioPercent, *ioPercent, 0}
+		case "n-inout":
+			config.Ranges[ParamTaskIODuration] = ParameterRange{*ioDuration, *ioDuration, 0}
+		case "kvant":
+			config.Ranges[ParamQuantum] = ParameterRange{*quantum, *quantum, 0}
+		}
+	})
+	model, err := NewConfiguredSystemModel(*seed, config)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	model.ConfigPath = *paramsPath
 	if *ticks > 0 {
 		for i := 0; i < *ticks; i++ {
 			model.StepSimulation()

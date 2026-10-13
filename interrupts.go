@@ -118,15 +118,16 @@ func (sys *SystemModel) StepGlobalAccess() {
 func (sys *SystemModel) StartIO(slot, cpuID int) {
 	p := &sys.ProcessTable[slot]
 	command := p.LastCommand
+	_, ioDuration := sys.TaskIOParameters(p)
 	count := command.IOCount
 	if count <= 0 || count > len(p.Memory) {
-		count = min(len(p.Memory), max(1, sys.NInOut))
+		count = min(len(p.Memory), max(1, ioDuration))
 	}
 	direction := command.Direction
 	if direction != IORead && direction != IOWrite {
 		direction = IORead
 	}
-	duration := max(1, sys.NInOut)
+	duration := max(1, ioDuration)
 	device := IODevice{ID: slot + 1, ProcessSlot: slot, TaskID: p.TaskID, CPUID: cpuID,
 		Direction: direction, Address: command.ResultAddress, Count: count,
 		Remaining: duration, Buffer: make([]int, count), Active: true, StartedTick: sys.GlobalPC}
