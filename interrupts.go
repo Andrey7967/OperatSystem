@@ -274,6 +274,7 @@ func (sys *SystemModel) RemoveProcess(slot int) {
 	if p.State == StateAbsent {
 		return
 	}
+	sys.CompleteTask(slot)
 	sys.FreeMemory += p.Size
 	sys.Process(slot, StateAbsent)
 	sys.ProcessTable[slot] = PSW{State: p.State}

@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -155,7 +154,9 @@ type SystemModel struct {
 
 	LastAction string
 
-	RNG *rand.Rand
+	Stats   ModelStatistics
+	Metrics [16]ProcessMetrics
+	RNG     *rand.Rand
 }
 
 // ============================================================
@@ -326,6 +327,7 @@ func (sys *SystemModel) LoadTask() bool {
 	}
 	sys.ProcessTable[freeSlot] = newTask
 	sys.Process(freeSlot, StateReady)
+	sys.RegisterTask(freeSlot)
 
 	// Генерируем следующее задание только после успешной загрузки текущего.
 	sys.PSW_Task = sys.GenerateTask()
@@ -415,6 +417,7 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
 	proc.QuantumUsed = 0
 
 	sys.RestoreProcessState(cpu, bestIdx)
+	sys.RecordDispatch(cpu.ID, proc.TaskID)
 
 	sys.LastAction = fmt.Sprintf(
 		"ЦП #%d: процесс #%d запущен (Base=%d, Dyn=%d, Effective=%d)",
@@ -649,6 +652,7 @@ func (sys *SystemModel) ExecuteCommand(cpu *CPU) {
 	command := sys.GenerateCommand(cpu)
 	// Длина команды равна одной ячейке: PC указывает на следующую команду.
 	cpu.PC++
+	sys.RecordCPUCommand(cpu)
 	sys.SaveProcessState(cpu)
 	sys.UpdateProcessPriority(proc)
 	proc.QuantumUsed++
@@ -694,6 +698,7 @@ func (sys *SystemModel) StepSimulation() {
 	if sys.GlobalPC == 1 {
 		sys.CheckSystemState()
 	}
+	sys.SampleStatistics()
 	// 1. Одна пользовательская команда на каждом занятом ЦП.
 	for i := range sys.CPUs {
 		cpu := &sys.CPUs[i]
@@ -701,14 +706,22 @@ func (sys *SystemModel) StepSimulation() {
 			continue
 		}
 		if cpu.WaitingGlobal && cpu.PendingAction == "" && !sys.TryGlobalAccess(cpu) {
+			sys.Metrics[cpu.ActiveProcID].GlobalTicks++
 			continue
 		}
 		switch cpu.PendingAction {
 		case "EXIT":
 			sys.FinishProcess(cpu)
+			if cpu.WaitingGlobal {
+				sys.Metrics[cpu.ActiveProcID].GlobalTicks++
+			}
 		case "IO":
 			sys.InitializeIO(cpu)
+			if cpu.WaitingGlobal {
+				sys.Metrics[cpu.ActiveProcID].GlobalTicks++
+			}
 		case "QUANTUM": // ожидает обработки уже поставленного прерывания
+			sys.Metrics[cpu.ActiveProcID].GlobalTicks++
 		default:
 			sys.ExecuteCommand(cpu)
 		}
@@ -804,203 +817,6 @@ func CleanupTerminal() {
 
 // ============================================================
 // Отрисовка интерфейса
-// ============================================================
-
-func (sys *SystemModel) RenderUI() {
-	sys.mu.Lock()
-	defer sys.mu.Unlock()
-
-	var b strings.Builder
-
-	// Переход в левый верхний угол
-	b.WriteString("\033[1;1H")
-
-	printlnLine := func(s string) {
-		b.WriteString(s)
-		b.WriteString("\033[K\n")
-	}
-
-	printfLine := func(format string, a ...interface{}) {
-		b.WriteString(fmt.Sprintf(format, a...))
-		b.WriteString("\033[K\n")
-	}
-
-	printlnLine("=========================================================================")
-
-	printfLine(
-		"МОДЕЛЬ ОПЕРАЦИОННОЙ СИСТЕМЫ | Вариант 5 (3 ЦП)",
-	)
-
-	printlnLine("=========================================================================")
-
-	printfLine(
-		"[Системный PC]: %-10d | [Скорость]: %-6.1f тактов/сек",
-		sys.GlobalPC,
-		sys.Speed,
-	)
-
-	printfLine(
-		"[Память ОЗУ]  : %d / %d (Свободно: %d)",
-		sys.TotalMemory-sys.FreeMemory,
-		sys.TotalMemory,
-		sys.FreeMemory,
-	)
-
-	printlnLine("-------------------------------------------------------------------------")
-
-	// =========================================================
-	// CPU
-	// =========================================================
-
-	printlnLine("СОСТОЯНИЕ ЦЕНТРАЛЬНЫХ ПРОЦЕССОРОВ (ЦП):")
-
-	for _, cpu := range sys.CPUs {
-		status := "Ожидание"
-
-		if cpu.IsBusy && cpu.ActiveProcID != -1 {
-			proc := &sys.ProcessTable[cpu.ActiveProcID]
-
-			status = fmt.Sprintf(
-				"Работа (Слот=%02d, TaskID=%d, PC=%d, Effective=%d)",
-				cpu.ActiveProcID,
-				proc.TaskID,
-				cpu.PC,
-				sys.EffectivePriority(proc),
-			)
-		}
-
-		if cpu.WaitingGlobal {
-			status += fmt.Sprintf(" | Ожидание общих данных: %d такта", sys.GlobalRemaining)
-		}
-		printfLine(
-			"   ЦП #%d: %s | Последняя команда: %s",
-			cpu.ID,
-			status,
-			cpu.LastCommand,
-		)
-	}
-
-	printlnLine("-------------------------------------------------------------------------")
-
-	// =========================================================
-	// Таблица процессов
-	// =========================================================
-
-	printfLine("ОБЩИЕ ДАННЫЕ: T_Globl=%d | Владелец ЦП=%d | Осталось=%d", sys.TGlob, sys.GlobalOwner, sys.GlobalRemaining)
-	printfLine("ПРЕРЫВАНИЯ: создано=%d обработано=%d ожидает=%d", sys.RaisedInterrupts, sys.HandledInterrupts, len(sys.Interrupts))
-	printfLine("Последнее прерывание: %s", sys.LastInterrupt)
-	printlnLine("ПРОЦЕССОРЫ ВВОДА/ВЫВОДА:")
-	for _, device := range sys.IODevices {
-		if device.ID == 0 {
-			continue
-		}
-		status := "Завершён"
-		if device.Active {
-			status = "Работа"
-		} else if device.InterruptPending {
-			status = "Ожидание обработки IRQ"
-		}
-		printfLine("   IO #%d | TaskID=%d | %s | %s | Осталось=%d | Передано=%d/%d | Буфер=%v",
-			device.ID, device.TaskID, device.Direction, status, device.Remaining, device.Transferred, device.Count, device.Buffer)
-	}
-	printlnLine("-------------------------------------------------------------------------")
-	printfLine("СИСТЕМНЫЕ ПРОЦЕССЫ IO: завершено %d", sys.CompletedSystemProcesses)
-	for _, process := range sys.SystemProcesses {
-		if process.ID == 0 {
-			continue
-		}
-		state := string(process.State)
-		if process.State == StateAbsent {
-			state = "Завершён"
-		}
-		printfLine("   SYS #%d | Задание #%d | ЦП #%d | PC=%d | %s | Такт %d -> %d",
-			process.ID, process.ParentTaskID, process.CPUID, process.PC, state,
-			process.CreatedTick, process.FinishedTick)
-	}
-	printlnLine("-------------------------------------------------------------------------")
-	printlnLine("ТАБЛИЦА ПРОЦЕССОВ (PSW):")
-
-	printfLine(
-		" %-4s %-8s %-12s %-4s %-12s %-8s %-8s %-8s",
-		"Слот",
-		"TaskID",
-		"Состояние",
-		"Код",
-		"PC/Total",
-		"Размер",
-		"Base",
-		"Dyn",
-	)
-
-	// printfLine(
-	//  " %-4s %-8s %-12s %-12s %-8s %-8s %-8s",
-	//  "",
-	//  "",
-	//  "",
-	//  "",
-	//  "",
-	//  "",
-	//  "Effective",
-	// )
-
-	renderedRows := 0
-
-	for i, proc := range sys.ProcessTable {
-		if proc.State == StateAbsent {
-			continue
-		}
-
-		renderedRows++
-
-		printfLine(
-			" [%02d] %-8d %-12s %-4d %d/%-7d %-8d %-8d %-8d",
-			i,
-			proc.TaskID,
-			proc.State,
-			proc.State.Code(),
-			proc.PC,
-			proc.TotalCommands,
-			proc.Size,
-			proc.BasePriority,
-			proc.DynPriority,
-		)
-
-		// Отдельной строкой итоговый приоритет
-		printfLine(
-			"       Effective=%d | Команда=%s | IO осталось=%d",
-			sys.EffectivePriority(&proc),
-			proc.LastCommand.Code,
-			proc.IORemaining,
-		)
-	}
-
-	// Очищаем оставшиеся строки
-	for i := renderedRows; i < 6; i++ {
-		b.WriteString("\033[K\n")
-		b.WriteString("\033[K\n")
-	}
-
-	printlnLine("=========================================================================")
-
-	printfLine("Effective = Base + Dyn | Квант = %d | IO = %d%%, %d такта",
-		sys.Kvant, sys.IOProbability, sys.NInOut)
-
-	printlnLine(
-		"[+] Скорость +10% | [-] Скорость -10% | [q] Выход",
-	)
-
-	printlnLine("=========================================================================")
-
-	printfLine(
-		"[Статус команды]: %s",
-		sys.LastAction,
-	)
-
-	fmt.Print(b.String())
-}
-
-// ============================================================
-// Обработка клавиатуры
 // ============================================================
 
 func (sys *SystemModel) HandleInput() {
@@ -1125,6 +941,8 @@ func main() {
 
 	model := NewSystemModel()
 	model.TGlob = *sharedTicks
+	// Запрос размера окна поддерживается терминалами с xterm-совместимым VT.
+	fmt.Printf("\033[8;%d;%dt\033[2J", ScreenHeight+1, ScreenWidth+1)
 
 	// --------------------------------------------------------
 	// Запуск обработки клавиатуры
