@@ -154,9 +154,10 @@ type SystemModel struct {
 
 	LastAction string
 
-	Stats   ModelStatistics
-	Metrics [16]ProcessMetrics
-	RNG     *rand.Rand
+	Stats        ModelStatistics
+	Metrics      [16]ProcessMetrics
+	RNG          *rand.Rand
+	Measurements []TaskMeasurement
 }
 
 // ============================================================
@@ -164,7 +165,11 @@ type SystemModel struct {
 // ============================================================
 
 func NewSystemModel() *SystemModel {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return NewSystemModelWithSeed(time.Now().UnixNano())
+}
+
+func NewSystemModelWithSeed(seed int64) *SystemModel {
+	rng := rand.New(rand.NewSource(seed))
 
 	sys := &SystemModel{
 		TotalMemory: 1024 * 2,
@@ -228,6 +233,8 @@ func PrintHelp() {
 	fmt.Println("  go run .            — Запуск моделирования")
 	fmt.Println("  go run . /?         — Вывод справки")
 	fmt.Println("  go run . -t-globl=2 — Общие таблицы заняты на 2 такта")
+	fmt.Println("  go run . -seed=25 -ticks=400 -results=results.csv — Пакетный прогон ЛР7")
+	fmt.Println("  Параметры: -io=20 -n-inout=3 -kvant=10; длительности в модельных тактах")
 	fmt.Println()
 	fmt.Println("Директивы:")
 	fmt.Println("  +                    — Увеличить скорость на 10%")
@@ -898,11 +905,32 @@ func main() {
 
 	options := flag.NewFlagSet("model", flag.ContinueOnError)
 	sharedTicks := options.Int("t-globl", 0, "число тактов монопольного доступа к общим таблицам")
+	seed := options.Int64("seed", time.Now().UnixNano(), "начальное состояние генератора")
+	ticks := options.Int("ticks", 0, "число тактов пакетного прогона; 0 = интерактивно")
+	ioPercent := options.Int("io", 20, "процент команд IO до EXIT")
+	ioDuration := options.Int("n-inout", 3, "длительность IO в тактах")
+	quantum := options.Int("kvant", 10, "квант команд")
+	results := options.String("results", "", "CSV завершённых заданий")
 	if err := options.Parse(os.Args[1:]); err != nil {
 		return
 	}
-	if *sharedTicks < 0 {
-		fmt.Println("t-globl должен быть неотрицательным")
+	if *sharedTicks < 0 || *ticks < 0 || *ioPercent < 0 || *ioPercent > 100 || *ioDuration < 1 || *quantum < 1 {
+		fmt.Fprintln(os.Stderr, "Требуется: t-globl,ticks >= 0; io = 0..100; n-inout,kvant >= 1")
+		os.Exit(2)
+	}
+	model := NewSystemModelWithSeed(*seed)
+	model.TGlob, model.IOProbability, model.NInOut, model.Kvant = *sharedTicks, *ioPercent, *ioDuration, *quantum
+	if *ticks > 0 {
+		for i := 0; i < *ticks; i++ {
+			model.StepSimulation()
+		}
+		fmt.Println(model.BuildScreen())
+		if *results != "" {
+			if err := model.ExportMeasurements(*results); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+		}
 		return
 	}
 	EnableRawMode()
@@ -939,8 +967,6 @@ func main() {
 	// Создание модели
 	// --------------------------------------------------------
 
-	model := NewSystemModel()
-	model.TGlob = *sharedTicks
 	// Запрос размера окна поддерживается терминалами с xterm-совместимым VT.
 	fmt.Printf("\033[8;%d;%dt\033[2J", ScreenHeight+1, ScreenWidth+1)
 
@@ -968,6 +994,11 @@ func main() {
 		) * time.Millisecond
 
 		time.Sleep(delay)
+	}
+	if *results != "" {
+		if err := model.ExportMeasurements(*results); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
 	}
 
 	// --------------------------------------------------------

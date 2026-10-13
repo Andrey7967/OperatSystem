@@ -178,6 +178,12 @@ func (sys *SystemModel) StepIO() {
 			continue
 		}
 		device.Remaining--
+		// Однопрограммный эталон: только работа устройства, без ожидания IRQ.
+		m := &sys.Metrics[device.ProcessSlot]
+		if m.TaskID == device.TaskID {
+			m.MonoTicks++
+			m.IOTicks++
+		}
 		parent.IORemaining = device.Remaining
 		if device.Remaining == 0 {
 			device.Active = false

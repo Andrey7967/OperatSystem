@@ -12,6 +12,7 @@ type ProcessMetrics struct {
 	FirstRunTick                                    uint64
 	Started                                         bool
 	ReadyTicks, BlockedTicks, GlobalTicks, Executed uint64
+	MonoTicks, MultiTicks, IOTicks                  uint64
 }
 
 type CPUStatistics struct {
@@ -28,6 +29,7 @@ type ModelStatistics struct {
 	ResponseCount                                                            uint64
 	ReadyQueueSum, BlockedQueueSum                                           uint64
 	CPUs                                                                     [3]CPUStatistics
+	MonoSum, MultiSum                                                        uint64 // Только успешно завершённые задания.
 }
 
 func (sys *SystemModel) RegisterTask(slot int) {
@@ -44,14 +46,14 @@ func (sys *SystemModel) SampleStatistics() {
 	ready, blocked := sys.QueueLengths()
 	sys.Stats.ReadyQueueSum += uint64(ready)
 	sys.Stats.BlockedQueueSum += uint64(blocked)
+	sys.IncreaseReadyProcessTime(1)
 	for slot := range sys.ProcessTable {
 		p, m := &sys.ProcessTable[slot], &sys.Metrics[slot]
 		if p.State == StateAbsent || m.TaskID != p.TaskID {
 			continue
 		}
+		m.MultiTicks++
 		switch p.State {
-		case StateReady:
-			m.ReadyTicks++
 		case StateBlocked, StateInitIO:
 			m.BlockedTicks++
 		}
@@ -63,6 +65,7 @@ func (sys *SystemModel) RecordCPUCommand(cpu *CPU) {
 	p := &sys.ProcessTable[cpu.ActiveProcID]
 	if m.TaskID == p.TaskID {
 		m.Executed++
+		m.MonoTicks++
 		if !m.Started {
 			m.Started = true
 			m.FirstRunTick = sys.GlobalPC
@@ -91,9 +94,18 @@ func (sys *SystemModel) CompleteTask(slot int) {
 		return
 	}
 	sys.Stats.Completed++
-	if sys.ProcessTable[slot].LastCommand.Code != OpExit {
+	success := sys.ProcessTable[slot].LastCommand.Code == OpExit
+	if !success {
 		sys.Stats.Failed++
+	} else {
+		sys.Stats.MonoSum += m.MonoTicks
+		sys.Stats.MultiSum += m.MultiTicks
 	}
+	sys.Measurements = append(sys.Measurements, TaskMeasurement{
+		TaskID: m.TaskID, Success: success, LoadedTick: m.LoadedTick, FinishedTick: sys.GlobalPC,
+		Mono: m.MonoTicks, Multi: m.MultiTicks, Commands: m.Executed, IO: m.IOTicks,
+		Ready: m.ReadyTicks, Blocked: m.BlockedTicks, Global: m.GlobalTicks,
+	})
 	sys.Stats.WaitSum += m.ReadyTicks
 	sys.Stats.BlockedSum += m.BlockedTicks
 	sys.Stats.GlobalSum += m.GlobalTicks
@@ -139,13 +151,13 @@ func screenLine(text string) string {
 }
 
 func (sys *SystemModel) DisplayConstantInformation(lines []string) {
-	lines[0] = "МОДЕЛЬ ОС | Лабораторная 6 | Вариант 25 -> 5 | 3 ЦП | Экран 160 x 42 (терминал от 161 x 43)"
+	lines[0] = "МОДЕЛЬ ОС | Лабораторная 7 | Вариант 25 -> 5 | 3 ЦП | Экран 160 x 42 (терминал от 161 x 43)"
 	lines[1] = "Управление: [+] скорость +10%  [-] скорость -10%  [q] выход | В Windows ввод клавиши + Enter"
 	lines[2] = "СИСТЕМА"
 	lines[5] = "НОВОЕ ЗАДАНИЕ (подготовлено, ещё не загружено)"
 	lines[7] = "ЦЕНТРАЛЬНЫЕ ПРОЦЕССОРЫ | Seq: последние 16 назначений, слева старые, справа новые"
 	lines[11] = "ПРОЦЕССЫ | S: 0 отсутствует, 1 готов, 2 активен, 3 блокирован, 4 инициализация IO | M: размер выделенной памяти"
-	lines[12] = "Слот Task S   PC/Всего     M Base  Dyn    P  Q IOrem CMD  A1 A2 AR Dir  Cnt | IO tr/cnt rem buf0 | загрузка отклик ожид IOож глоб вып"
+	lines[12] = "Слот Task S   PC/Всего     M Base  Dyn    P  Q IOrem CMD  A1 A2 AR Dir  Cnt | IO tr/cnt rem buf0 | Tmono Tmulti Dexe% Dready%"
 	for slot := 0; slot < 16; slot++ {
 		lines[13+slot] = fmt.Sprintf("[%02d] -", slot)
 	}
@@ -189,11 +201,7 @@ func (sys *SystemModel) DisplayProcessParameters(lines []string) {
 		if len(dev.Buffer) > 0 {
 			buf = fmt.Sprint(dev.Buffer[0])
 		}
-		response := "-"
-		if m.Started {
-			response = fmt.Sprint(m.FirstRunTick - m.LoadedTick)
-		}
-		lines[13+slot] = fmt.Sprintf("[%02d] %4d %d %4d/%-5d %5d %4d %4d %4d %2d %5d %-4s %2d %2d %2d %-5s %3d | %2d/%-3d %3d %4s | %6d %6s %4d %4d %4d %4d", slot, p.TaskID, p.State.Code(), p.PC, p.TotalCommands, p.Size, p.BasePriority, p.DynPriority, sys.EffectivePriority(&p), p.QuantumUsed, p.IORemaining, cmd.Code, cmd.Address1, cmd.Address2, cmd.ResultAddress, cmd.Direction, cmd.IOCount, dev.Transferred, dev.Count, dev.Remaining, buf, m.LoadedTick, response, m.ReadyTicks, m.BlockedTicks, m.GlobalTicks, m.Executed)
+		lines[13+slot] = fmt.Sprintf("[%02d] %4d %d %4d/%-5d %5d %4d %4d %4d %2d %5d %-4s %2d %2d %2d %-5s %3d | %2d/%-3d %3d %4s | %5d %6d %6.1f %7.1f", slot, p.TaskID, p.State.Code(), p.PC, p.TotalCommands, p.Size, p.BasePriority, p.DynPriority, sys.EffectivePriority(&p), p.QuantumUsed, p.IORemaining, cmd.Code, cmd.Address1, cmd.Address2, cmd.ResultAddress, cmd.Direction, cmd.IOCount, dev.Transferred, dev.Count, dev.Remaining, buf, m.MonoTicks, m.MultiTicks, executionIncrease(m.MonoTicks, m.MultiTicks), 100*average(m.ReadyTicks, m.MultiTicks))
 	}
 }
 
@@ -210,7 +218,10 @@ func (sys *SystemModel) DisplayAverageParameters(lines []string) {
 	lines[30] = fmt.Sprintf("Вход N=%d: размер=%.2f длина=%.2f Base=%.2f | Выход N=%d (ошибки=%d)", s.Loaded, average(s.InputSize, s.Loaded), average(s.InputLength, s.Loaded), average(s.InputPriority, s.Loaded), s.Completed, s.Failed)
 	lines[31] = fmt.Sprintf("Выход: ожид=%.2f IOож=%.2f глоб=%.2f вып=%.2f оборот=%.2f отклик=%.2f (N=%d)", average(s.WaitSum, s.Completed), average(s.BlockedSum, s.Completed), average(s.GlobalSum, s.Completed), average(s.ExecutionSum, s.Completed), average(s.TurnaroundSum, s.Completed), average(s.ResponseSum, s.ResponseCount), s.ResponseCount)
 	lines[32] = fmt.Sprintf("Средняя очередь: готово=%.2f блокировано=%.2f | Производительность=%.4f успешных завершений/такт", average(s.ReadyQueueSum, sys.GlobalPC), average(s.BlockedQueueSum, sys.GlobalPC), average(s.Completed-s.Failed, sys.GlobalPC))
-	lines[33] = "До появления наблюдений среднее равно 0. Отклик = первый запуск - загрузка; оборот = удаление - загрузка."
+	p := sys.Performance()
+	lines[33] = fmt.Sprintf("ЛР7 успех N=%d: Tmono=%.2f Tmulti=%.2f Tmono_all=%d Mmono=%.3f Dmulti=%.2f%% Dexe=%.2f%%", p.Completed, p.MeanMono, p.MeanMulti, s.MonoSum, p.MonoTasks, p.Relative, executionIncrease(s.MonoSum, s.MultiSum))
+	lines[34] = "Tmono: команды + работа IO; Tmulti: все такты жизни. Dexe=100*(Tmulti/Tmono-1); Dready=100*готовность/Tmulti."
+	lines[35] = "Dmulti=100*Mmulti/(такт/среднее Tmono). Службы внутри такта; T_Globl добавляет задержки в Tmulti."
 }
 
 // Вызывается под mutex: все семь секций относятся к одному такту.
