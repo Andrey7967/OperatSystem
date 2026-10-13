@@ -13,6 +13,7 @@ type ProcessMetrics struct {
 	Started                                         bool
 	ReadyTicks, BlockedTicks, GlobalTicks, Executed uint64
 	MonoTicks, MultiTicks, IOTicks                  uint64
+	SuspendedTicks                                  uint64
 }
 
 type CPUStatistics struct {
@@ -30,6 +31,7 @@ type ModelStatistics struct {
 	ReadyQueueSum, BlockedQueueSum                                           uint64
 	CPUs                                                                     [3]CPUStatistics
 	MonoSum, MultiSum                                                        uint64 // Только успешно завершённые задания.
+	Cancelled                                                                uint64 // Подмножество Failed: уничтоженные оператором.
 }
 
 func (sys *SystemModel) RegisterTask(slot int) {
@@ -53,6 +55,9 @@ func (sys *SystemModel) SampleStatistics() {
 			continue
 		}
 		m.MultiTicks++
+		if p.Suspended {
+			m.SuspendedTicks++
+		}
 		switch p.State {
 		case StateBlocked, StateInitIO:
 			m.BlockedTicks++
@@ -97,6 +102,9 @@ func (sys *SystemModel) CompleteTask(slot int) {
 	success := sys.ProcessTable[slot].LastCommand.Code == OpExit
 	if !success {
 		sys.Stats.Failed++
+		if sys.ProcessTable[slot].LastCommand.Code == "KILL" {
+			sys.Stats.Cancelled++
+		}
 	} else {
 		sys.Stats.MonoSum += m.MonoTicks
 		sys.Stats.MultiSum += m.MultiTicks
@@ -127,7 +135,7 @@ func average(sum, count uint64) float64 {
 
 func (sys *SystemModel) QueueLengths() (ready, blocked int) {
 	for _, p := range sys.ProcessTable {
-		if p.State == StateReady {
+		if p.State == StateReady && !p.Suspended {
 			ready++
 		}
 		if p.State == StateBlocked || p.State == StateInitIO {
@@ -138,7 +146,7 @@ func (sys *SystemModel) QueueLengths() (ready, blocked int) {
 }
 
 const ScreenWidth = 160
-const ScreenHeight = 42
+const ScreenHeight = 45
 
 // Одна строка всегда занимает фиксированную ширину, включая пустые ячейки.
 func screenLine(text string) string {
@@ -151,7 +159,7 @@ func screenLine(text string) string {
 }
 
 func (sys *SystemModel) DisplayConstantInformation(lines []string) {
-	lines[0] = "МОДЕЛЬ ОС | Лабораторная 8 | Вариант 25 -> 5 | 3 ЦП | Экран 160 x 42 (терминал от 161 x 43)"
+	lines[0] = "МОДЕЛЬ ОС | Лабораторная 9 | Вариант 25 -> 5 | 3 ЦП | Экран 160 x 45 (терминал от 161 x 46)"
 	lines[1] = "Управление: [+] скорость +10%  [-] скорость -10%  [q] выход | В Windows ввод клавиши + Enter"
 	lines[2] = "СИСТЕМА"
 	if sys.Config != nil {
@@ -164,10 +172,13 @@ func (sys *SystemModel) DisplayConstantInformation(lines []string) {
 	for slot := 0; slot < 16; slot++ {
 		lines[13+slot] = fmt.Sprintf("[%02d] -", slot)
 	}
-	lines[29] = "СРЕДНИЕ ЗНАЧЕНИЯ | вход: все загруженные; выход: удалённые (завершение или ошибка); очередь: все такты"
+	lines[29] = "СРЕДНИЕ ЗНАЧЕНИЯ | вход: все загруженные; выход: удалённые (завершение, ошибка, kill); очередь: все такты"
 	lines[34] = "Показатели в тактах: ожид=готовность, IOож=блокировка, глоб=ожидание таблиц активным ЦП, вып=исполненные команды включая EXIT."
 	lines[35] = "Полезная загрузка ЦП = такты с пользовательской командой / все такты. Служебная инициализация IO в этот показатель не входит."
 	lines[36] = "READ: буфер устройства -> память; WRITE: память -> буфер. Завершение IO переводит процесс в готовность через прерывание."
+	lines[42] = "Директивы + Enter: task key=value | pause-load | resume-load | load | suspend ID | resume ID | kill ID | memory N | speed N | finish | help"
+	lines[43] = "Директива > " + sys.InputLine
+	lines[44] = "Оператор: " + sys.LastDirective
 }
 
 func (sys *SystemModel) DisplaySystemParameters(lines []string) {
@@ -214,6 +225,9 @@ func (sys *SystemModel) DisplayProcessParameters(lines []string) {
 		if p.HasTaskParameters {
 			lines[13+slot] += fmt.Sprintf(" IO:%d%%/%d", p.IOPercent, p.IODuration)
 		}
+		if p.Suspended {
+			lines[13+slot] += " H=1"
+		}
 	}
 }
 
@@ -227,17 +241,23 @@ func (sys *SystemModel) DisplayExecutionSequence(lines []string) {
 
 func (sys *SystemModel) DisplayAverageParameters(lines []string) {
 	s := sys.Stats
-	lines[30] = fmt.Sprintf("Вход N=%d: размер=%.2f длина=%.2f Base=%.2f | Выход N=%d (ошибки=%d)", s.Loaded, average(s.InputSize, s.Loaded), average(s.InputLength, s.Loaded), average(s.InputPriority, s.Loaded), s.Completed, s.Failed)
+	lines[30] = fmt.Sprintf("Вход N=%d: размер=%.2f длина=%.2f Base=%.2f | Выход N=%d (ошибки=%d уничтожено=%d)", s.Loaded, average(s.InputSize, s.Loaded), average(s.InputLength, s.Loaded), average(s.InputPriority, s.Loaded), s.Completed, s.Failed-s.Cancelled, s.Cancelled)
 	lines[31] = fmt.Sprintf("Выход: ожид=%.2f IOож=%.2f глоб=%.2f вып=%.2f оборот=%.2f отклик=%.2f (N=%d)", average(s.WaitSum, s.Completed), average(s.BlockedSum, s.Completed), average(s.GlobalSum, s.Completed), average(s.ExecutionSum, s.Completed), average(s.TurnaroundSum, s.Completed), average(s.ResponseSum, s.ResponseCount), s.ResponseCount)
 	lines[32] = fmt.Sprintf("Средняя очередь: готово=%.2f блокировано=%.2f | Производительность=%.4f успешных завершений/такт", average(s.ReadyQueueSum, sys.GlobalPC), average(s.BlockedQueueSum, sys.GlobalPC), average(s.Completed-s.Failed, sys.GlobalPC))
 	p := sys.Performance()
 	lines[33] = fmt.Sprintf("ЛР7 успех N=%d: Tmono=%.2f Tmulti=%.2f Tmono_all=%d Mmono=%.3f Dmulti=%.2f%% Dexe=%.2f%%", p.Completed, p.MeanMono, p.MeanMulti, s.MonoSum, p.MonoTasks, p.Relative, executionIncrease(s.MonoSum, s.MultiSum))
 	lines[34] = "Tmono: команды + работа IO; Tmulti: все такты жизни. Dexe=100*(Tmulti/Tmono-1); Dready=100*готовность/Tmulti."
-	lines[35] = "Dmulti=100*Mmulti/(такт/среднее Tmono). Службы внутри такта; T_Globl добавляет задержки в Tmulti."
+	lines[35] = fmt.Sprintf("Автозагрузка остановлена=%t | finish=%t | питание=%t | H=1: приостановлен оператором", sys.PauseLoad, sys.DrainRequested, sys.IsRunning)
 }
 
 // Вызывается под mutex: все семь секций относятся к одному такту.
 func (sys *SystemModel) BuildScreen() string {
+	sys.mu.Lock()
+	defer sys.mu.Unlock()
+	return sys.buildScreenLocked()
+}
+
+func (sys *SystemModel) buildScreenLocked() string {
 	lines := make([]string, ScreenHeight)
 	sys.DisplayConstantInformation(lines)
 	sys.DisplaySystemParameters(lines)
@@ -256,7 +276,7 @@ func (sys *SystemModel) RenderUI() {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
 	// Абсолютная позиция каждой строки исключает прокрутку и перенос строки.
-	lines := strings.Split(sys.BuildScreen(), "\n")
+	lines := strings.Split(sys.buildScreenLocked(), "\n")
 	var b strings.Builder
 	for i, line := range lines {
 		fmt.Fprintf(&b, "\033[%d;1H%s\033[K", i+1, line)

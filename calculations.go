@@ -24,7 +24,7 @@ type PerformanceParameters struct {
 func (sys *SystemModel) IncreaseReadyProcessTime(ticks uint64) {
 	for slot, p := range sys.ProcessTable {
 		m := &sys.Metrics[slot]
-		if p.State == StateReady && p.TaskID == m.TaskID && m.TaskID != 0 {
+		if p.State == StateReady && !p.Suspended && p.TaskID == m.TaskID && m.TaskID != 0 {
 			m.ReadyTicks += ticks
 		}
 	}

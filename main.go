@@ -85,6 +85,8 @@ type PSW struct {
 	State                 ProcessState // Состояние процесса
 	IOPercent, IODuration int          // Индивидуальные параметры задания из файла.
 	HasTaskParameters     bool
+	Suspended             bool
+	DeferredAction        string // IO или EXIT уже выполнены, служба отложена.
 }
 
 // ============================================================
@@ -156,13 +158,15 @@ type SystemModel struct {
 
 	LastAction string
 
-	Stats        ModelStatistics
-	Metrics      [16]ProcessMetrics
-	RNG          *rand.Rand
-	Measurements []TaskMeasurement
-	Config       *ParameterConfig
-	ConfigPath   string
-	Seed         int64
+	Stats                    ModelStatistics
+	Metrics                  [16]ProcessMetrics
+	RNG                      *rand.Rand
+	Measurements             []TaskMeasurement
+	Config                   *ParameterConfig
+	ConfigPath               string
+	Seed                     int64
+	DrainRequested           bool
+	InputLine, LastDirective string
 }
 
 // ============================================================
@@ -254,7 +258,13 @@ func PrintHelp() {
 	fmt.Println("  go run . -seed=25 -ticks=400 -results=results.csv — Пакетный прогон ЛР7")
 	fmt.Println("  Параметры: -io=20 -n-inout=3 -kvant=10; длительности в модельных тактах")
 	fmt.Println()
-	fmt.Println("Директивы:")
+	fmt.Println("ЛР9: -script=lab9/demo.txt -ticks=3000 — сценарий директив")
+	fmt.Println("Директивы (строка + Enter; +, -, q сразу при пустой строке):")
+	fmt.Println("  task size=N commands=N io=N duration=N priority=N — новое задание")
+	fmt.Println("  pause-load / resume-load / load — остановить / возобновить / загрузить одно")
+	fmt.Println("  suspend ID / resume ID / kill ID — выбор по TaskID")
+	fmt.Println("  memory N / speed N — память (ячейки) / скорость (такты/с)")
+	fmt.Println("  finish — выполнить загруженные задания и выключить питание")
 	fmt.Println("  +                    — Увеличить скорость на 10%")
 	fmt.Println("  -                    — Уменьшить скорость на 10%")
 	fmt.Println("  q                    — Завершить моделирование")
@@ -328,9 +338,14 @@ func (sys *SystemModel) HasFreeMemory(required int) bool {
 // ============================================================
 
 func (sys *SystemModel) LoadTask() bool {
-	if sys.PauseLoad {
+	if sys.PauseLoad || sys.DrainRequested {
 		return false
 	}
+	return sys.loadPreparedTask()
+}
+
+// Вызывается под mutex; ручная загрузка обходит только паузу автозагрузки.
+func (sys *SystemModel) loadPreparedTask() bool {
 
 	freeSlot := -1
 
@@ -392,7 +407,7 @@ func (sys *SystemModel) GetNextProcessForCPU() int {
 	for i := 0; i < len(sys.ProcessTable); i++ {
 		proc := &sys.ProcessTable[i]
 
-		if proc.State != StateReady {
+		if proc.State != StateReady || proc.Suspended {
 			continue
 		}
 
@@ -453,6 +468,8 @@ func (sys *SystemModel) DispatchProcess(cpu *CPU) bool {
 	proc.QuantumUsed = 0
 
 	sys.RestoreProcessState(cpu, bestIdx)
+	cpu.PendingAction = proc.DeferredAction
+	proc.DeferredAction = ""
 	sys.RecordDispatch(cpu.ID, proc.TaskID)
 
 	sys.LastAction = fmt.Sprintf(
@@ -730,6 +747,9 @@ func (sys *SystemModel) ExecuteCommand(cpu *CPU) {
 func (sys *SystemModel) StepSimulation() {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
+	if !sys.IsRunning {
+		return
+	}
 	sys.GlobalPC++
 	sys.StepGlobalAccess()
 	// Начальное назначение — часть инициализации цикла.
@@ -773,6 +793,7 @@ func (sys *SystemModel) StepSimulation() {
 	sys.HandleInterrupts()
 	// 4-5. Проверка состояния, загрузка и новые назначения.
 	sys.CheckSystemState()
+	sys.CheckDrainCompletion()
 	// 6. Отрисовка вызывается главным циклом после окончания такта.
 }
 
@@ -783,6 +804,10 @@ func (sys *SystemModel) StepSimulation() {
 func (sys *SystemModel) ChangeSpeed(factor float64) {
 	sys.mu.Lock()
 	defer sys.mu.Unlock()
+	sys.changeSpeedLocked(factor)
+}
+
+func (sys *SystemModel) changeSpeedLocked(factor float64) {
 
 	newSpeed := sys.Speed * factor
 
@@ -857,57 +882,6 @@ func CleanupTerminal() {
 // Отрисовка интерфейса
 // ============================================================
 
-func (sys *SystemModel) HandleInput() {
-	buf := make([]byte, 1)
-
-	for {
-		if !sys.GetRunning() {
-			return
-		}
-
-		n, err := os.Stdin.Read(buf)
-
-		if err != nil || n == 0 {
-			continue
-		}
-
-		char := string(buf[0])
-
-		switch char {
-
-		case "+":
-
-			sys.ChangeSpeed(1.10)
-
-			sys.mu.Lock()
-			sys.LastAction = fmt.Sprintf(
-				"Нажато '+' -> Скорость увеличена до %.1f тактов/сек",
-				sys.Speed,
-			)
-			sys.mu.Unlock()
-
-		case "-":
-
-			sys.ChangeSpeed(0.90)
-
-			sys.mu.Lock()
-			sys.LastAction = fmt.Sprintf(
-				"Нажато '-' -> Скорость уменьшена до %.1f тактов/сек",
-				sys.Speed,
-			)
-			sys.mu.Unlock()
-
-		case "q", "Q":
-
-			sys.mu.Lock()
-			sys.IsRunning = false
-			sys.mu.Unlock()
-
-			return
-		}
-	}
-}
-
 // ============================================================
 // MAIN
 // ============================================================
@@ -942,12 +916,17 @@ func main() {
 	ioPercent := options.Int("io", 20, "процент команд IO до EXIT")
 	ioDuration := options.Int("n-inout", 3, "длительность IO в тактах")
 	quantum := options.Int("kvant", 10, "квант команд")
+	scriptPath := options.String("script", "", "сценарий директив для пакетного режима")
 	results := options.String("results", "", "CSV завершённых заданий")
 	if err := options.Parse(os.Args[1:]); err != nil {
 		return
 	}
 	if *sharedTicks < 0 || *ticks < 0 || *ioPercent < 0 || *ioPercent > 100 || *ioDuration < 1 || *quantum < 1 {
 		fmt.Fprintln(os.Stderr, "Требуется: t-globl,ticks >= 0; io = 0..100; n-inout,kvant >= 1")
+		os.Exit(2)
+	}
+	if *scriptPath != "" && *ticks == 0 {
+		fmt.Fprintln(os.Stderr, "-script требует -ticks > 0")
 		os.Exit(2)
 	}
 	config, err := ReadParameterFile(*paramsPath)
@@ -975,8 +954,17 @@ func main() {
 	}
 	model.ConfigPath = *paramsPath
 	if *ticks > 0 {
-		for i := 0; i < *ticks; i++ {
-			model.StepSimulation()
+		var events []ScheduledDirective
+		if *scriptPath != "" {
+			events, err = ReadDirectiveScript(*scriptPath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+		}
+		if err := model.RunBatch(*ticks, events); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
 		}
 		fmt.Println(model.BuildScreen())
 		if *results != "" {
@@ -1062,6 +1050,6 @@ func main() {
 	CleanupTerminal()
 
 	fmt.Println(
-		"\nМоделирование завершено по команде оператора ('q').",
+		"\nМоделирование завершено.",
 	)
 }
